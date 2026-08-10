@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Workflow Interaction"
+  short_description: "Route requests into the agent workflow backend"
+  default_prompt: "Use $use-agent-workflow to handle this request with minimal user coordination."

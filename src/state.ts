@@ -2,7 +2,12 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import type { AgentRole, AgentUsage, WorkflowRunOutput } from "./contracts.js";
+import type {
+  AgentRole,
+  AgentUsage,
+  ModelProfile,
+  WorkflowRunOutput,
+} from "./contracts.js";
 
 export type AgentRunStatus = "running" | "completed" | "failed";
 
@@ -11,6 +16,7 @@ export interface CreateAgentRun {
   workflowId: string;
   parentRunId: string | null;
   role: AgentRole;
+  profile: ModelProfile;
   taskDir: string;
 }
 
@@ -43,6 +49,7 @@ export class StateStore {
         workflow_id TEXT NOT NULL REFERENCES workflows(id),
         parent_run_id TEXT REFERENCES agent_runs(id),
         role TEXT NOT NULL,
+        profile TEXT NOT NULL,
         task_dir TEXT NOT NULL,
         thread_id TEXT,
         status TEXT NOT NULL,
@@ -61,6 +68,7 @@ export class StateStore {
         created_at TEXT NOT NULL
       );
     `);
+    this.ensureAgentRunProfileColumn();
   }
 
   close(): void {
@@ -108,14 +116,15 @@ export class StateStore {
     this.database
       .prepare(`
         INSERT INTO agent_runs (
-          id, workflow_id, parent_run_id, role, task_dir, status, started_at
-        ) VALUES (?, ?, ?, ?, ?, 'running', ?)
+          id, workflow_id, parent_run_id, role, profile, task_dir, status, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
       `)
       .run(
         input.id,
         input.workflowId,
         input.parentRunId,
         input.role,
+        input.profile,
         input.taskDir,
         new Date().toISOString(),
       );
@@ -172,5 +181,18 @@ export class StateStore {
     return this.database
       .prepare("SELECT * FROM agent_runs WHERE workflow_id = ? ORDER BY started_at, id")
       .all(workflowId) as Record<string, unknown>[];
+  }
+
+  private ensureAgentRunProfileColumn(): void {
+    const columns = this.database
+      .prepare("PRAGMA table_info(agent_runs)")
+      .all() as { name: string }[];
+    if (!columns.some((column) => column.name === "profile")) {
+      // Before profile routing, every Agent used the fixed Sol high route.
+      // Preserve that historical fact while making the migrated column non-null.
+      this.database.exec(
+        "ALTER TABLE agent_runs ADD COLUMN profile TEXT NOT NULL DEFAULT 'sol_high'",
+      );
+    }
   }
 }

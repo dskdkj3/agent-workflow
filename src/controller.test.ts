@@ -21,6 +21,7 @@ import {
   emptyUsage,
   type AgentRole,
   type AgentUsage,
+  type ModelProfile,
 } from "./contracts.js";
 import { WorkflowController } from "./controller.js";
 
@@ -36,6 +37,7 @@ type RunnerCall =
   | {
       kind: "start";
       role: AgentRole;
+      profile: ModelProfile;
       workspace: string;
       taskDir: string;
       prompt: string;
@@ -43,6 +45,7 @@ type RunnerCall =
   | {
       kind: "continue";
       role: AgentRole;
+      profile: ModelProfile;
       threadId: string;
       workspace: string;
       taskDir: string;
@@ -60,6 +63,7 @@ class FakeAgentRunner implements AgentRunner {
     this.calls.push({
       kind: "start",
       role: request.role,
+      profile: request.profile,
       workspace: request.workspace,
       taskDir: request.taskDir,
       prompt: request.prompt,
@@ -73,6 +77,7 @@ class FakeAgentRunner implements AgentRunner {
     this.calls.push({
       kind: "continue",
       role: request.role,
+      profile: request.profile,
       threadId: request.threadId,
       workspace: request.workspace,
       taskDir: request.taskDir,
@@ -116,6 +121,14 @@ const workerUsage: AgentUsage = {
   reasoning_output_tokens: 8,
 };
 
+const verifierUsage: AgentUsage = {
+  input_tokens: 12,
+  cached_input_tokens: 3,
+  cache_write_input_tokens: 1,
+  output_tokens: 4,
+  reasoning_output_tokens: 5,
+};
+
 const finalDeltaUsage: AgentUsage = {
   input_tokens: 7,
   cached_input_tokens: 1,
@@ -157,7 +170,7 @@ function mode(path: string): number {
   return statSync(path).mode & 0o777;
 }
 
-test("runs Orchestrator -> Worker -> same Orchestrator and persists the result", async (t) => {
+test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists the result", async (t) => {
   const fixture = createFixture();
   const runner = new FakeAgentRunner([
     {
@@ -167,6 +180,8 @@ test("runs Orchestrator -> Worker -> same Orchestrator and persists the result",
         status: "ready",
         summary: "Delegation is ready",
         worker_task: "Implement the requested fixture change",
+        worker_profile: "luna_max",
+        verifier_profile: "terra_high",
         completion_criteria: ["The fixture change is present", "Tests pass"],
         questions: [],
         blocker: null,
@@ -184,6 +199,19 @@ test("runs Orchestrator -> Worker -> same Orchestrator and persists the result",
         blocker: null,
       },
       usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "verifier-thread",
+      output: {
+        status: "passed",
+        summary: "Independent verification passed",
+        findings: [],
+        result_path: null,
+        questions: [],
+        blocker: null,
+      },
+      usage: verifierUsage,
     },
     {
       kind: "continue",
@@ -216,30 +244,52 @@ test("runs Orchestrator -> Worker -> same Orchestrator and persists the result",
   assert.equal(output.summary, "Verified the fixture change");
   assert.deepEqual(
     output.usage,
-    sumUsage(orchestratorCumulativeUsage, workerUsage),
+    sumUsage(orchestratorCumulativeUsage, workerUsage, verifierUsage),
   );
   assert.deepEqual(
-    runner.calls.map((call) => [call.kind, call.role]),
+    runner.calls.map((call) => [call.kind, call.role, call.profile]),
     [
-      ["start", "orchestrator"],
-      ["start", "worker"],
-      ["continue", "orchestrator"],
+      ["start", "orchestrator", "sol_high"],
+      ["start", "worker", "luna_max"],
+      ["start", "verifier", "terra_high"],
+      ["continue", "orchestrator", "sol_high"],
     ],
   );
-  const finalCall = runner.calls[2];
+  const planCall = runner.calls[0];
+  assert.equal(planCall?.kind, "start");
+  if (planCall?.kind === "start") {
+    assert.match(planCall.prompt, /do not include internal workflow steps/);
+  }
+  const workerCall = runner.calls[1];
+  assert.equal(workerCall?.kind, "start");
+  if (workerCall?.kind === "start") {
+    assert.match(workerCall.prompt, /Verifier runs only after your turn finishes/);
+  }
+  const verifierCall = runner.calls[2];
+  assert.equal(verifierCall?.kind, "start");
+  if (verifierCall?.kind === "start") {
+    assert.doesNotMatch(verifierCall.prompt, /Worker journal:/);
+    assert.match(verifierCall.prompt, /external evidence-first perspective/);
+  }
+  const finalCall = runner.calls[3];
   assert.equal(finalCall?.kind, "continue");
   if (finalCall?.kind === "continue") {
     assert.equal(finalCall.threadId, "orchestrator-thread");
     assert.match(finalCall.prompt, /Worker completed the fixture change/);
+    assert.match(finalCall.prompt, /Independent verification passed/);
+    assert.doesNotMatch(finalCall.prompt, /Worker journal:/);
   }
 
   const orchestratorDir = join(output.task_dir, "orchestrator");
   const workerDir = join(output.task_dir, "workers", "worker-1");
+  const verifierDir = join(output.task_dir, "verifier");
   assert.equal(output.result_path, join(orchestratorDir, "result.md"));
   assert.equal(mode(join(orchestratorDir, "task.md")), 0o444);
   assert.equal(mode(join(orchestratorDir, "result.md")), 0o444);
   assert.equal(mode(join(workerDir, "task.md")), 0o444);
   assert.equal(mode(join(workerDir, "result.md")), 0o444);
+  assert.equal(mode(join(verifierDir, "task.md")), 0o444);
+  assert.equal(mode(join(verifierDir, "result.md")), 0o444);
   assert.notEqual(mode(join(orchestratorDir, "journal.md")) & 0o200, 0);
   assert.match(
     readFileSync(join(workerDir, "task.md"), "utf8"),
@@ -249,26 +299,42 @@ test("runs Orchestrator -> Worker -> same Orchestrator and persists the result",
     readFileSync(join(orchestratorDir, "result.md"), "utf8"),
     /Verified the fixture change/,
   );
+  assert.match(
+    readFileSync(join(verifierDir, "result.md"), "utf8"),
+    /Independent verification passed/,
+  );
 
   const workflow = controller.store.getWorkflow(output.workflow_id);
   assert.equal(workflow?.status, "completed");
   assert.deepEqual(JSON.parse(String(workflow?.usage_json)), output.usage);
 
   const runs = controller.store.listAgentRuns(output.workflow_id);
-  assert.equal(runs.length, 2);
+  assert.equal(runs.length, 3);
   const orchestratorRun = runs.find((run) => run.role === "orchestrator");
   const workerRun = runs.find((run) => run.role === "worker");
+  const verifierRun = runs.find((run) => run.role === "verifier");
   assert.ok(orchestratorRun);
   assert.ok(workerRun);
+  assert.ok(verifierRun);
   assert.equal(orchestratorRun.status, "completed");
+  assert.equal(orchestratorRun.profile, "sol_high");
   assert.equal(orchestratorRun.thread_id, "orchestrator-thread");
   assert.deepEqual(
     JSON.parse(String(orchestratorRun.usage_json)),
     orchestratorCumulativeUsage,
   );
   assert.equal(workerRun.status, "completed");
+  assert.equal(workerRun.profile, "luna_max");
   assert.equal(workerRun.thread_id, "worker-thread");
   assert.equal(workerRun.parent_run_id, orchestratorRun.id);
+  assert.equal(verifierRun.status, "completed");
+  assert.equal(verifierRun.profile, "terra_high");
+  assert.equal(verifierRun.thread_id, "verifier-thread");
+  assert.equal(verifierRun.parent_run_id, orchestratorRun.id);
+  assert.deepEqual(
+    JSON.parse(String(verifierRun.usage_json)),
+    verifierUsage,
+  );
 
   const events = controller.store.database
     .prepare(
@@ -281,9 +347,97 @@ test("runs Orchestrator -> Worker -> same Orchestrator and persists the result",
       "workflow.started",
       "orchestrator.planned",
       "worker.completed",
+      "verifier.completed",
       "orchestrator.completed",
       "workflow.completed",
     ],
+  );
+});
+
+test("lets the Orchestrator reject a result after independent findings", async (t) => {
+  const fixture = createFixture();
+  const runner = new FakeAgentRunner([
+    {
+      kind: "start",
+      threadId: "orchestrator-rejection-thread",
+      output: {
+        status: "ready",
+        summary: "Delegation is ready",
+        worker_task: "Implement the requested fixture change",
+        worker_profile: "luna_max",
+        verifier_profile: "sol_high",
+        completion_criteria: ["The requested behavior is observable"],
+        questions: [],
+        blocker: null,
+      },
+      usage: planUsage,
+    },
+    {
+      kind: "start",
+      threadId: "worker-rejected-thread",
+      output: {
+        status: "completed",
+        summary: "Worker claims completion",
+        result_path: null,
+        questions: [],
+        blocker: null,
+      },
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "verifier-findings-thread",
+      output: {
+        status: "findings",
+        summary: "The requested behavior is not implemented",
+        findings: [
+          {
+            issue: "The expected file is absent",
+            evidence: "A workspace listing contains no expected.txt",
+          },
+        ],
+        result_path: null,
+        questions: [],
+        blocker: null,
+      },
+      usage: verifierUsage,
+    },
+    {
+      kind: "continue",
+      threadId: "orchestrator-rejection-thread",
+      output: {
+        status: "failed",
+        summary: "Independent evidence shows the task is incomplete",
+        result_path: null,
+        questions: [],
+        blocker: "The expected file is absent",
+      },
+      usage: orchestratorCumulativeUsage,
+    },
+  ]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+  });
+  t.after(() => {
+    controller.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  const output = await controller.run({
+    request: "Create the expected fixture output",
+    workspace: fixture.workspace,
+  });
+
+  assert.equal(output.status, "failed");
+  assert.match(output.summary, /Independent evidence/);
+  assert.match(
+    readFileSync(join(output.task_dir, "verifier", "result.md"), "utf8"),
+    /workspace listing contains no expected\.txt/,
+  );
+  assert.deepEqual(
+    output.usage,
+    sumUsage(orchestratorCumulativeUsage, workerUsage, verifierUsage),
   );
 });
 
@@ -297,6 +451,8 @@ test("returns needs_input from the planning turn without starting a Worker", asy
         status: "needs_input",
         summary: "A target choice is required",
         worker_task: null,
+        worker_profile: null,
+        verifier_profile: null,
         completion_criteria: [],
         questions: ["Which target should be changed?"],
         blocker: null,
@@ -339,6 +495,8 @@ test("converts a runner failure into a failed workflow", async (t) => {
         status: "ready",
         summary: "Worker can proceed",
         worker_task: "Run the failing worker fixture",
+        worker_profile: "luna_max",
+        verifier_profile: "terra_high",
         completion_criteria: ["Worker reports a result"],
         questions: [],
         blocker: null,

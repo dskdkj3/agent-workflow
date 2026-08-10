@@ -7,10 +7,16 @@ import {
 } from "@openai/codex-sdk";
 import { z } from "zod";
 
-import type { AgentRole, AgentUsage } from "./contracts.js";
+import {
+  modelProfiles,
+  type AgentRole,
+  type AgentUsage,
+  type ModelProfile,
+} from "./contracts.js";
 
 export interface AgentTurnRequest<T> {
   role: AgentRole;
+  profile: ModelProfile;
   workspace: string;
   taskDir: string;
   prompt: string;
@@ -36,7 +42,6 @@ export interface AgentRunner {
 
 export interface CodexAgentRunnerOptions {
   codexPath?: string;
-  model?: string;
   disabledMcpServerName?: string;
 }
 
@@ -66,14 +71,15 @@ function parseStructuredOutput<T>(text: string, schema: z.ZodType<T>): T {
 }
 
 export class CodexAgentRunner implements AgentRunner {
-  readonly model: string;
-  private readonly codex: Codex;
+  private readonly codexByProfile = new Map<ModelProfile, Codex>();
+  private readonly options: CodexAgentRunnerOptions;
+  private readonly baseConfig: NonNullable<CodexOptions["config"]>;
 
   constructor(options: CodexAgentRunnerOptions = {}) {
-    this.model = options.model ?? "gpt-5.6-sol";
+    this.options = options;
 
     const disabledMcpServerName = options.disabledMcpServerName?.trim();
-    const config: NonNullable<CodexOptions["config"]> = {
+    this.baseConfig = {
       memories: {
         use_memories: false,
         generate_memories: false,
@@ -92,22 +98,19 @@ export class CodexAgentRunner implements AgentRunner {
           }
         : {}),
     };
-
-    this.codex = new Codex({
-      ...(options.codexPath ? { codexPathOverride: options.codexPath } : {}),
-      config,
-    });
   }
 
   async start<T>(request: AgentTurnRequest<T>): Promise<AgentTurnResult<T>> {
-    const thread = this.codex.startThread(this.threadOptions(request));
+    const thread = this.codex(request.profile).startThread(
+      this.threadOptions(request),
+    );
     return this.run(thread, request);
   }
 
   async continue<T>(
     request: ContinueAgentTurnRequest<T>,
   ): Promise<AgentTurnResult<T>> {
-    const thread = this.codex.resumeThread(
+    const thread = this.codex(request.profile).resumeThread(
       request.threadId,
       this.threadOptions(request),
     );
@@ -115,17 +118,41 @@ export class CodexAgentRunner implements AgentRunner {
   }
 
   private threadOptions<T>(request: AgentTurnRequest<T>): ThreadOptions {
+    const profile = modelProfiles[request.profile];
     return {
-      model: this.model,
+      model: profile.model,
       sandboxMode: "danger-full-access",
       workingDirectory: request.workspace,
       skipGitRepoCheck: true,
-      modelReasoningEffort: "high",
       networkAccessEnabled: true,
       webSearchMode: "live",
       approvalPolicy: "never",
       additionalDirectories: [request.taskDir],
     };
+  }
+
+  private codex(profileName: ModelProfile): Codex {
+    const existing = this.codexByProfile.get(profileName);
+    if (existing) {
+      return existing;
+    }
+
+    const profile = modelProfiles[profileName];
+    const codex = new Codex({
+      ...(this.options.codexPath
+        ? { codexPathOverride: this.options.codexPath }
+        : {}),
+      config: {
+        ...this.baseConfig,
+        // Codex core supports the real `max` effort, while the SDK 0.147
+        // ThreadOptions union still stops at `xhigh`. Passing it through the
+        // generic config surface preserves the upstream effort without an
+        // incorrect max -> xhigh downgrade.
+        model_reasoning_effort: profile.reasoningEffort,
+      },
+    });
+    this.codexByProfile.set(profileName, codex);
+    return codex;
   }
 
   private async run<T>(

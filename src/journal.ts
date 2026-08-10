@@ -6,7 +6,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-import type { AgentOutcome, AgentRole } from "./contracts.js";
+import type {
+  AgentOutcome,
+  AgentRole,
+  VerificationOutcome,
+} from "./contracts.js";
 
 export interface AgentJournalPaths {
   directory: string;
@@ -88,6 +92,35 @@ export function ensureFrozenFailureResult(path: string, message: string): void {
     writeFileSync(
       path,
       `# Result\n\n- Status: \`failed\`\n\n## Failure\n\n${message}\n`,
+      "utf8",
+    );
+  }
+  chmodSync(path, 0o444);
+}
+
+export function ensureFrozenVerificationResult(
+  path: string,
+  outcome: VerificationOutcome,
+): void {
+  if (!existsSync(path)) {
+    const findings =
+      outcome.findings.length === 0
+        ? "- None"
+        : outcome.findings
+            .map(
+              (finding) =>
+                `- ${finding.issue}\n  - Evidence: ${finding.evidence}`,
+            )
+            .join("\n");
+    writeFileSync(
+      path,
+      `# Result\n\n` +
+        `- Role: \`verifier\`\n` +
+        `- Status: \`${outcome.status}\`\n\n` +
+        `## Summary\n\n${outcome.summary}\n\n` +
+        `## Findings\n\n${findings}\n\n` +
+        `## Questions\n\n${markdownList(outcome.questions)}\n\n` +
+        `## Blocker\n\n${outcome.blocker ?? "None"}\n`,
       "utf8",
     );
   }

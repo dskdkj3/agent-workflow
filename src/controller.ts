@@ -8,10 +8,13 @@ import {
   agentOutcomeSchema,
   emptyUsage,
   orchestrationPlanSchema,
+  verificationOutcomeSchema,
   workflowRunInputSchema,
   workflowRunOutputSchema,
   type AgentOutcome,
   type AgentUsage,
+  type ModelProfile,
+  type VerificationOutcome,
   type WorkflowRunInput,
   type WorkflowRunOutput,
 } from "./contracts.js";
@@ -19,11 +22,13 @@ import {
   createAgentJournal,
   ensureFrozenFailureResult,
   ensureFrozenResult,
+  ensureFrozenVerificationResult,
   type AgentJournalPaths,
 } from "./journal.js";
 import {
   finalOrchestratorPrompt,
   initialOrchestratorPrompt,
+  verifierPrompt,
   workerPrompt,
 } from "./prompts.js";
 import { StateStore } from "./state.js";
@@ -33,6 +38,8 @@ export interface WorkflowControllerOptions {
   runner: AgentRunner;
 }
 
+const ORCHESTRATOR_PROFILE: ModelProfile = "sol_high";
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -41,6 +48,16 @@ function normalizedOutcome(
   outcome: AgentOutcome,
   resultPath: string,
 ): AgentOutcome {
+  return {
+    ...outcome,
+    result_path: resultPath,
+  };
+}
+
+function normalizedVerificationOutcome(
+  outcome: VerificationOutcome,
+  resultPath: string,
+): VerificationOutcome {
   return {
     ...outcome,
     result_path: resultPath,
@@ -111,6 +128,7 @@ export class WorkflowController {
       workflowId,
       parentRunId: null,
       role: "orchestrator",
+      profile: ORCHESTRATOR_PROFILE,
       taskDir: orchestratorJournal.directory,
     });
 
@@ -118,10 +136,14 @@ export class WorkflowController {
     let orchestratorFinished = false;
     let workerRunId: string | null = null;
     let workerFinished = false;
+    let verifierRunId: string | null = null;
+    let verifierFinished = false;
+    let verifierUsage = emptyUsage();
 
     try {
       const planTurn = await this.runner.start({
         role: "orchestrator",
+        profile: ORCHESTRATOR_PROFILE,
         workspace,
         taskDir: orchestratorJournal.directory,
         prompt: initialOrchestratorPrompt({
@@ -175,6 +197,19 @@ export class WorkflowController {
       if (planTurn.output.worker_task === null) {
         throw new Error('Orchestrator returned status "ready" without worker_task');
       }
+      if (planTurn.output.worker_profile === null) {
+        throw new Error(
+          'Orchestrator returned status "ready" without worker_profile',
+        );
+      }
+      if (planTurn.output.verifier_profile === null) {
+        throw new Error(
+          'Orchestrator returned status "ready" without verifier_profile',
+        );
+      }
+
+      const workerProfile = planTurn.output.worker_profile;
+      const verifierProfile = planTurn.output.verifier_profile;
 
       const workerJournal = createAgentJournal({
         directory: join(workflowTaskDir, "workers", "worker-1"),
@@ -191,11 +226,13 @@ export class WorkflowController {
         workflowId,
         parentRunId: orchestratorRunId,
         role: "worker",
+        profile: workerProfile,
         taskDir: workerJournal.directory,
       });
 
       const workerTurn = await this.runner.start({
         role: "worker",
+        profile: workerProfile,
         workspace,
         taskDir: workerJournal.directory,
         prompt: workerPrompt({ workspace, journal: workerJournal }),
@@ -218,8 +255,80 @@ export class WorkflowController {
         usage: workerTurn.usage,
       });
 
+      let verifierJournal: AgentJournalPaths | null = null;
+      let verifierOutcome: VerificationOutcome | null = null;
+      if (workerOutcome.status === "completed") {
+        verifierJournal = createAgentJournal({
+          directory: join(workflowTaskDir, "verifier"),
+          role: "verifier",
+          workflowId,
+          workspace,
+          objective:
+            "Independently verify the Worker result against the original workflow request.",
+          completionCriteria: [
+            ...planTurn.output.completion_criteria,
+            "Report only evidence-backed material findings.",
+            "Do not modify the implementation under verification.",
+          ],
+        });
+        const currentVerifierRunId = randomUUID();
+        verifierRunId = currentVerifierRunId;
+        this.store.createAgentRun({
+          id: currentVerifierRunId,
+          workflowId,
+          parentRunId: orchestratorRunId,
+          role: "verifier",
+          profile: verifierProfile,
+          taskDir: verifierJournal.directory,
+        });
+
+        const verifierTurn = await this.runner.start({
+          role: "verifier",
+          profile: verifierProfile,
+          workspace,
+          taskDir: verifierJournal.directory,
+          prompt: verifierPrompt({
+            request: input.request,
+            workspace,
+            journal: verifierJournal,
+            workerJournal,
+            completionCriteria: planTurn.output.completion_criteria,
+          }),
+          schema: verificationOutcomeSchema,
+          ...(signal ? { signal } : {}),
+        });
+        this.store.setAgentThread(currentVerifierRunId, verifierTurn.threadId);
+        verifierUsage = addUsage(verifierUsage, verifierTurn.usage);
+        totalUsage = addUsage(totalUsage, verifierTurn.usage);
+        verifierOutcome = normalizedVerificationOutcome(
+          verifierTurn.output,
+          verifierJournal.result,
+        );
+        ensureFrozenVerificationResult(
+          verifierJournal.result,
+          verifierOutcome,
+        );
+        this.store.finishAgentRun(
+          currentVerifierRunId,
+          "completed",
+          verifierUsage,
+        );
+        verifierFinished = true;
+        this.store.appendEvent(
+          workflowId,
+          currentVerifierRunId,
+          "verifier.completed",
+          {
+            thread_id: verifierTurn.threadId,
+            outcome: verifierOutcome,
+            usage: verifierTurn.usage,
+          },
+        );
+      }
+
       const finalTurn = await this.runner.continue({
         role: "orchestrator",
+        profile: ORCHESTRATOR_PROFILE,
         threadId: orchestratorThreadId,
         workspace,
         taskDir: orchestratorJournal.directory,
@@ -228,6 +337,11 @@ export class WorkflowController {
           orchestratorJournal,
           workerJournal,
           workerOutcomeJson: JSON.stringify(workerOutcome, null, 2),
+          verifierJournal,
+          verifierOutcomeJson:
+            verifierOutcome === null
+              ? null
+              : JSON.stringify(verifierOutcome, null, 2),
         }),
         schema: agentOutcomeSchema,
         ...(signal ? { signal } : {}),
@@ -241,7 +355,10 @@ export class WorkflowController {
       // persisted thread is resumed. Replace the earlier Orchestrator snapshot
       // instead of counting its planning turn twice.
       orchestratorUsage = finalTurn.usage ?? orchestratorUsage;
-      totalUsage = addUsage(orchestratorUsage, workerUsage);
+      totalUsage = addUsage(
+        addUsage(orchestratorUsage, workerUsage),
+        verifierUsage,
+      );
       const finalOutcome = normalizedOutcome(
         finalTurn.output,
         orchestratorJournal.result,
@@ -280,6 +397,14 @@ export class WorkflowController {
         : errorMessage(error);
       if (workerRunId !== null && !workerFinished) {
         this.store.finishAgentRun(workerRunId, "failed", workerUsage, message);
+      }
+      if (verifierRunId !== null && !verifierFinished) {
+        this.store.finishAgentRun(
+          verifierRunId,
+          "failed",
+          verifierUsage,
+          message,
+        );
       }
       if (!orchestratorFinished) {
         this.store.finishAgentRun(

@@ -9,7 +9,8 @@ Interaction Agent
   -> workflow.run
   -> Orchestrator
   -> Generic Worker
-  -> Orchestrator verification
+  -> independent Verifier
+  -> Orchestrator judgment
   -> Interaction Agent
 ```
 
@@ -18,7 +19,9 @@ Interaction Agent
 - MCP SDK `2.0.0`, protocol revision `2026-07-28`
 - Codex SDK `0.147.0`
 - stdio transport only
-- one Worker per workflow run
+- one Worker and one independent Verifier per completed workflow run
+- allowlisted model routes: `luna_max`, `terra_high`, `sol_high`, `sol_max`
+- Orchestrator uses `sol_high`; it chooses Worker and Verifier routes from the residual cognitive burden
 - no MCP Tasks, MRTR, scheduler, durable retry engine, or persistent routing learner
 - no NixOS or Home Manager installation yet
 
@@ -65,6 +68,15 @@ subprocess for the MCP `2026-07-28` handshake. It does not spend model quota.
 The TypeScript Codex SDK exposes the Codex thread ID but not the App Server turn ID.
 The Controller therefore persists thread IDs, its own run IDs, and an ordered event
 sequence. Journal files currently preserve only their latest contents; checkpointed
-Git history and compaction hooks are not implemented yet. The first live Codex
-smoke test completed correctly, but its latency and token usage were too high for
-this three-Agent path to become the default daily interface without optimization.
+history and compaction hooks are not implemented yet. Detailed Worker and Verifier
+evidence stays in workspace and task artifacts; the final Orchestrator prompt receives
+compact structured outcomes and artifact paths instead of Agent conversation history.
+
+The SDK `0.147.0` TypeScript `ThreadOptions` union does not yet include the real
+`max` effort. This project passes `model_reasoning_effort="max"` through the generic
+Codex config surface for `luna_max` and `sol_max`; it never downgrades `max` to
+`xhigh`.
+
+The repository contains a non-installed Interaction skill at
+`skills/use-agent-workflow/`. Installation and daily wrapper wiring remain outside
+this MCP MVP.
