@@ -237,8 +237,11 @@ export class WorkflowController {
           `Codex resumed Orchestrator as a different thread: ${finalTurn.threadId}`,
         );
       }
-      orchestratorUsage = addUsage(orchestratorUsage, finalTurn.usage);
-      totalUsage = addUsage(totalUsage, finalTurn.usage);
+      // Codex SDK 0.147 reports the latest cumulative usage snapshot when a
+      // persisted thread is resumed. Replace the earlier Orchestrator snapshot
+      // instead of counting its planning turn twice.
+      orchestratorUsage = finalTurn.usage ?? orchestratorUsage;
+      totalUsage = addUsage(orchestratorUsage, workerUsage);
       const finalOutcome = normalizedOutcome(
         finalTurn.output,
         orchestratorJournal.result,

@@ -65,5 +65,6 @@ subprocess for the MCP `2026-07-28` handshake. It does not spend model quota.
 The TypeScript Codex SDK exposes the Codex thread ID but not the App Server turn ID.
 The Controller therefore persists thread IDs, its own run IDs, and an ordered event
 sequence. Journal files currently preserve only their latest contents; checkpointed
-Git history and compaction hooks are not implemented yet. A quota-consuming live
-Codex smoke test has not been run yet.
+Git history and compaction hooks are not implemented yet. The first live Codex
+smoke test completed correctly, but its latency and token usage were too high for
+this three-Agent path to become the default daily interface without optimization.

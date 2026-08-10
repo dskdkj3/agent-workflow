@@ -25,6 +25,7 @@ export interface ContinueAgentTurnRequest<T> extends AgentTurnRequest<T> {
 export interface AgentTurnResult<T> {
   threadId: string;
   output: T;
+  /** Latest cumulative usage snapshot for this Codex thread. */
   usage: AgentUsage | null;
 }
 

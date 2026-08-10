@@ -116,13 +116,15 @@ const workerUsage: AgentUsage = {
   reasoning_output_tokens: 8,
 };
 
-const finalUsage: AgentUsage = {
+const finalDeltaUsage: AgentUsage = {
   input_tokens: 7,
   cached_input_tokens: 1,
   cache_write_input_tokens: 0,
   output_tokens: 2,
   reasoning_output_tokens: 3,
 };
+
+const orchestratorCumulativeUsage = sumUsage(planUsage, finalDeltaUsage);
 
 function sumUsage(...items: AgentUsage[]): AgentUsage {
   return items.reduce<AgentUsage>(
@@ -193,7 +195,7 @@ test("runs Orchestrator -> Worker -> same Orchestrator and persists the result",
         questions: [],
         blocker: null,
       },
-      usage: finalUsage,
+      usage: orchestratorCumulativeUsage,
     },
   ]);
   const controller = new WorkflowController({
@@ -212,7 +214,10 @@ test("runs Orchestrator -> Worker -> same Orchestrator and persists the result",
 
   assert.equal(output.status, "completed");
   assert.equal(output.summary, "Verified the fixture change");
-  assert.deepEqual(output.usage, sumUsage(planUsage, workerUsage, finalUsage));
+  assert.deepEqual(
+    output.usage,
+    sumUsage(orchestratorCumulativeUsage, workerUsage),
+  );
   assert.deepEqual(
     runner.calls.map((call) => [call.kind, call.role]),
     [
@@ -259,7 +264,7 @@ test("runs Orchestrator -> Worker -> same Orchestrator and persists the result",
   assert.equal(orchestratorRun.thread_id, "orchestrator-thread");
   assert.deepEqual(
     JSON.parse(String(orchestratorRun.usage_json)),
-    sumUsage(planUsage, finalUsage),
+    orchestratorCumulativeUsage,
   );
   assert.equal(workerRun.status, "completed");
   assert.equal(workerRun.thread_id, "worker-thread");
