@@ -4,7 +4,7 @@ This repository implements the standalone Workflow MCP described by the project 
 
 ## Current MVP
 
-- MCP protocol target: `2026-07-28`; the stdio entry rejects legacy connections.
+- MCP protocol target: modern `2026-07-28`; the stdio entry must also serve the `2025-06-18` initialize handshake used by current Codex clients.
 - Public surface: one synchronous tool, `workflow.run`.
 - Execution path: one `sol_high` Orchestrator thread, one routed Generic Worker thread, one fresh-context independent Verifier thread, then the same Orchestrator thread judges and finalizes.
 - Allowlisted model profiles are `luna_max`, `terra_high`, `sol_high`, and `sol_max`; preserve the real `max` effort through Codex config and never map it to `xhigh`.

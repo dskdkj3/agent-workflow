@@ -42,6 +42,66 @@ function workflowOutput(
   });
 }
 
+function testStdioProtocol(
+  protocolVersion: "2025-06-18" | "2026-07-28",
+  era: "Legacy" | "Modern",
+): void {
+  test(
+    `stdio entry negotiates MCP ${protocolVersion} and lists workflow.run`,
+    { timeout: 20_000 },
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "agent-workflow-stdio-"));
+      const serverPath = fileURLToPath(new URL("./server.js", import.meta.url));
+      const projectDir = dirname(dirname(serverPath));
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [serverPath],
+        cwd: projectDir,
+        env: {
+          ...getDefaultEnvironment(),
+          AGENT_WORKFLOW_STATE_DIR: join(root, "state"),
+        },
+        stderr: "pipe",
+      });
+      let stderr = "";
+      transport.stderr?.on("data", (chunk: Buffer | string) => {
+        stderr += chunk.toString();
+      });
+      const client = new Client(
+        {
+          name: `agent-workflow-${era.toLowerCase()}-test`,
+          version: "0.1.0",
+        },
+        {
+          supportedProtocolVersions: [protocolVersion],
+          versionNegotiation:
+            protocolVersion === "2025-06-18"
+              ? { mode: "legacy" }
+              : {
+                  mode: { pin: protocolVersion },
+                  probe: { timeoutMs: 5_000 },
+                },
+        },
+      );
+
+      try {
+        await client.connect(transport);
+        assert.equal(client.getNegotiatedProtocolVersion(), protocolVersion);
+        const listed = await client.listTools();
+        assert.ok(listed.tools.some((tool) => tool.name === "workflow.run"));
+      } catch (error) {
+        const detail = error instanceof Error ? error.stack : String(error);
+        throw new Error(
+          `${era} stdio MCP check failed: ${detail}\n${stderr}`,
+        );
+      } finally {
+        await client.close().catch(() => undefined);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
 test("workflow.run exposes and returns validated structured output", async (t) => {
   const calls: unknown[] = [];
   const service: WorkflowService = {
@@ -113,48 +173,5 @@ test("workflow.run exposes and returns validated structured output", async (t) =
   );
 });
 
-test(
-  "stdio entry negotiates MCP 2026-07-28 and lists workflow.run",
-  { timeout: 20_000 },
-  async () => {
-    const root = mkdtempSync(join(tmpdir(), "agent-workflow-stdio-"));
-    const serverPath = fileURLToPath(new URL("./server.js", import.meta.url));
-    const projectDir = dirname(dirname(serverPath));
-    const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [serverPath],
-      cwd: projectDir,
-      env: {
-        ...getDefaultEnvironment(),
-        AGENT_WORKFLOW_STATE_DIR: join(root, "state"),
-      },
-      stderr: "pipe",
-    });
-    let stderr = "";
-    transport.stderr?.on("data", (chunk: Buffer | string) => {
-      stderr += chunk.toString();
-    });
-    const client = new Client(
-      { name: "agent-workflow-modern-test", version: "0.1.0" },
-      {
-        versionNegotiation: {
-          mode: { pin: "2026-07-28" },
-          probe: { timeoutMs: 5_000 },
-        },
-      },
-    );
-
-    try {
-      await client.connect(transport);
-      assert.equal(client.getNegotiatedProtocolVersion(), "2026-07-28");
-      const listed = await client.listTools();
-      assert.ok(listed.tools.some((tool) => tool.name === "workflow.run"));
-    } catch (error) {
-      const detail = error instanceof Error ? error.stack : String(error);
-      throw new Error(`Modern stdio MCP check failed: ${detail}\n${stderr}`);
-    } finally {
-      await client.close().catch(() => undefined);
-      rmSync(root, { recursive: true, force: true });
-    }
-  },
-);
+testStdioProtocol("2025-06-18", "Legacy");
+testStdioProtocol("2026-07-28", "Modern");

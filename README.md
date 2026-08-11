@@ -16,7 +16,7 @@ Interaction Agent
 
 ## Current boundaries
 
-- MCP SDK `2.0.0`, protocol revision `2026-07-28`
+- MCP SDK `2.0.0`, modern protocol revision `2026-07-28`, with stdio compatibility for Codex clients using the `2025-06-18` initialize handshake
 - Codex SDK `0.147.0`
 - stdio transport only
 - one Worker and one independent Verifier per completed workflow run
@@ -70,8 +70,9 @@ Host integrations may pass provider-specific Codex settings through
 `AGENT_WORKFLOW_CODEX_CONFIG_JSON`; keep secrets out of that JSON and reference an
 inherited environment variable with the provider's `env_key` instead.
 
-`npm run check` uses a fake `AgentRunner` for workflow execution and a real stdio
-subprocess for the MCP `2026-07-28` handshake. It does not spend model quota.
+`npm run check` uses a fake `AgentRunner` for workflow execution and real stdio
+subprocesses for the MCP `2025-06-18` and `2026-07-28` handshakes. It does not
+spend model quota.
 
 ## Current implementation limit
 

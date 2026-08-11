@@ -90,7 +90,7 @@ async function main(): Promise<void> {
     runner,
   });
   const handle = serveStdio(() => createWorkflowMcpServer(controller), {
-    legacy: "reject",
+    legacy: "serve",
     onerror: (error) => {
       process.stderr.write(`[agent-workflow] MCP error: ${error.message}\n`);
     },
