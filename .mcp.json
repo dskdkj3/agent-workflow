@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "agent-workflow": {
+      "command": "agent-workflow-mcp",
+      "args": [],
+      "env": {
+        "AGENT_WORKFLOW_MCP_SERVER_NAME": "agent-workflow"
+      }
+    }
+  }
+}

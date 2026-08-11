@@ -6,6 +6,9 @@
   "engines": {
     "node": ">=24"
   },
+  "bin": {
+    "agent-workflow-mcp": "dist/server.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test dist/*.test.js",

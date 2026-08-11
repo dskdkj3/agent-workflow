@@ -1,0 +1,32 @@
+{
+  "name": "agent-workflow",
+  "version": "0.1.0",
+  "description": "Route Codex requests through a minimal Orchestrator, Worker, and independent Verifier workflow.",
+  "author": {
+    "name": "dskdkj3",
+    "email": "267648850+dskdkj3@users.noreply.github.com",
+    "url": "https://github.com/dskdkj3"
+  },
+  "homepage": "https://github.com/dskdkj3/agent-workflow",
+  "repository": "https://github.com/dskdkj3/agent-workflow",
+  "keywords": [
+    "agent",
+    "codex",
+    "orchestration",
+    "verification"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Agent Workflow",
+    "shortDescription": "Route substantial work through isolated backend agents.",
+    "longDescription": "Adds an Interaction policy and the workflow.run MCP backend for a minimal Codex Orchestrator, Generic Worker, and independent Verifier flow.",
+    "developerName": "dskdkj3",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": "Use the agent workflow when this request benefits from isolated execution or independent verification."
+  }
+}

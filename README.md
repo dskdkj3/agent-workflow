@@ -23,7 +23,7 @@ Interaction Agent
 - allowlisted model routes: `luna_max`, `terra_high`, `sol_high`, `sol_max`
 - Orchestrator uses `sol_high`; it chooses Worker and Verifier routes from the residual cognitive burden
 - no MCP Tasks, MRTR, scheduler, durable retry engine, or persistent routing learner
-- no NixOS or Home Manager installation yet
+- standalone Nix package for the internal `agent-workflow-mcp` server; host integration remains external
 
 ## Tool
 
@@ -54,6 +54,13 @@ npm run check
 npm start
 ```
 
+The flake default package installs the internal stdio server:
+
+```bash
+nix build
+./result/bin/agent-workflow-mcp
+```
+
 State defaults to `${XDG_STATE_HOME:-~/.local/state}/agent-workflow`. Override it with
 `AGENT_WORKFLOW_STATE_DIR`. Override the SDK-managed Codex executable with
 `AGENT_WORKFLOW_CODEX_PATH` when validating a specific runtime build. If the server
@@ -77,6 +84,6 @@ The SDK `0.147.0` TypeScript `ThreadOptions` union does not yet include the real
 Codex config surface for `luna_max` and `sol_max`; it never downgrades `max` to
 `xhigh`.
 
-The repository contains a non-installed Interaction skill at
-`skills/use-agent-workflow/`. Installation and daily wrapper wiring remain outside
-this MCP MVP.
+The repository also contains a Codex plugin manifest and the Interaction skill at
+`skills/use-agent-workflow/`. Daily wrapper and Home Manager wiring remain outside
+this repository.
