@@ -43,6 +43,31 @@ export interface AgentRunner {
 export interface CodexAgentRunnerOptions {
   codexPath?: string;
   disabledMcpServerName?: string;
+  configJson?: string;
+}
+
+type CodexConfig = NonNullable<CodexOptions["config"]>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseCodexConfigJson(raw: string | undefined): CodexConfig {
+  if (raw === undefined || raw.trim() === "") {
+    return {};
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid AGENT_WORKFLOW_CODEX_CONFIG_JSON: ${detail}`);
+  }
+  if (!isRecord(parsed)) {
+    throw new Error("AGENT_WORKFLOW_CODEX_CONFIG_JSON must be a JSON object");
+  }
+  return parsed as CodexConfig;
 }
 
 function normalizeUsage(usage: Usage | null): AgentUsage | null {
@@ -78,8 +103,10 @@ export class CodexAgentRunner implements AgentRunner {
   constructor(options: CodexAgentRunnerOptions = {}) {
     this.options = options;
 
+    const integrationConfig = parseCodexConfigJson(options.configJson);
     const disabledMcpServerName = options.disabledMcpServerName?.trim();
     this.baseConfig = {
+      ...integrationConfig,
       memories: {
         use_memories: false,
         generate_memories: false,
@@ -93,6 +120,9 @@ export class CodexAgentRunner implements AgentRunner {
       ...(disabledMcpServerName
         ? {
             mcp_servers: {
+              ...(isRecord(integrationConfig.mcp_servers)
+                ? integrationConfig.mcp_servers
+                : {}),
               [disabledMcpServerName]: { enabled: false },
             },
           }

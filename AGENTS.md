@@ -9,6 +9,7 @@ This repository implements the standalone Workflow MCP described by the project 
 - Execution path: one `sol_high` Orchestrator thread, one routed Generic Worker thread, one fresh-context independent Verifier thread, then the same Orchestrator thread judges and finalizes.
 - Allowlisted model profiles are `luna_max`, `terra_high`, `sol_high`, and `sol_max`; preserve the real `max` effort through Codex config and never map it to `xhigh`.
 - Codex is behind an `AgentRunner` adapter. Do not couple Controller state or MCP schemas directly to Codex SDK internals.
+- Keep provider wiring outside the core; host integrations may inject generic Codex config through `AGENT_WORKFLOW_CODEX_CONFIG_JSON`.
 - Orchestrator, Worker, and Verifier must not use or generate Codex Memories and must not create subagents.
 - The Verifier must start in a fresh thread, receive the original request plus artifact paths, and avoid the Worker journal unless resolving a specific contradiction.
 - Every Agent owns `task.md`, `journal.md`, and `result.md`; `task.md` and completed `result.md` are frozen.

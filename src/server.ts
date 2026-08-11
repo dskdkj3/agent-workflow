@@ -81,6 +81,9 @@ async function main(): Promise<void> {
             process.env.AGENT_WORKFLOW_MCP_SERVER_NAME,
         }
       : {}),
+    ...(process.env.AGENT_WORKFLOW_CODEX_CONFIG_JSON
+      ? { configJson: process.env.AGENT_WORKFLOW_CODEX_CONFIG_JSON }
+      : {}),
   });
   const controller = new WorkflowController({
     stateDir: defaultStateDir(),

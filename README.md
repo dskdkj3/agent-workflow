@@ -66,6 +66,9 @@ State defaults to `${XDG_STATE_HOME:-~/.local/state}/agent-workflow`. Override i
 `AGENT_WORKFLOW_CODEX_PATH` when validating a specific runtime build. If the server
 is registered in child Codex configuration, set `AGENT_WORKFLOW_MCP_SERVER_NAME` to
 that registration name so child Agents cannot recursively invoke this workflow.
+Host integrations may pass provider-specific Codex settings through
+`AGENT_WORKFLOW_CODEX_CONFIG_JSON`; keep secrets out of that JSON and reference an
+inherited environment variable with the provider's `env_key` instead.
 
 `npm run check` uses a fake `AgentRunner` for workflow execution and a real stdio
 subprocess for the MCP `2026-07-28` handshake. It does not spend model quota.
