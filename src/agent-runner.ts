@@ -70,6 +70,44 @@ function parseCodexConfigJson(raw: string | undefined): CodexConfig {
   return parsed as CodexConfig;
 }
 
+export function buildCodexBaseConfig(
+  options: CodexAgentRunnerOptions = {},
+): CodexConfig {
+  const integrationConfig = parseCodexConfigJson(options.configJson);
+  const disabledMcpServerName = options.disabledMcpServerName?.trim();
+
+  return {
+    ...integrationConfig,
+    memories: {
+      use_memories: false,
+      generate_memories: false,
+    },
+    features: {
+      multi_agent: false,
+      multi_agent_v2: false,
+    },
+    model_verbosity: "high",
+    model_reasoning_summary: "auto",
+    ...(disabledMcpServerName
+      ? {
+          mcp_servers: {
+            ...(isRecord(integrationConfig.mcp_servers)
+              ? integrationConfig.mcp_servers
+              : {}),
+            // Codex validates an MCP server's transport even when it is
+            // disabled. Keep a complete inert stdio transport here so the
+            // backend cannot recursively invoke the outer Workflow MCP.
+            [disabledMcpServerName]: {
+              command: process.execPath,
+              args: ["-e", "process.exit(0)"],
+              enabled: false,
+            },
+          },
+        }
+      : {}),
+  };
+}
+
 function normalizeUsage(usage: Usage | null): AgentUsage | null {
   if (usage === null) {
     return null;
@@ -102,32 +140,7 @@ export class CodexAgentRunner implements AgentRunner {
 
   constructor(options: CodexAgentRunnerOptions = {}) {
     this.options = options;
-
-    const integrationConfig = parseCodexConfigJson(options.configJson);
-    const disabledMcpServerName = options.disabledMcpServerName?.trim();
-    this.baseConfig = {
-      ...integrationConfig,
-      memories: {
-        use_memories: false,
-        generate_memories: false,
-      },
-      features: {
-        multi_agent: false,
-        multi_agent_v2: false,
-      },
-      model_verbosity: "high",
-      model_reasoning_summary: "auto",
-      ...(disabledMcpServerName
-        ? {
-            mcp_servers: {
-              ...(isRecord(integrationConfig.mcp_servers)
-                ? integrationConfig.mcp_servers
-                : {}),
-              [disabledMcpServerName]: { enabled: false },
-            },
-          }
-        : {}),
-    };
+    this.baseConfig = buildCodexBaseConfig(options);
   }
 
   async start<T>(request: AgentTurnRequest<T>): Promise<AgentTurnResult<T>> {
