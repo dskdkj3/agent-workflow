@@ -132,7 +132,7 @@ Verification 不必阻塞实现内部继续推进，但必须阻塞最终 `compl
 
 - 当前 `workflow.run` 已为 `single_worker` 单列 `completion_criteria`，但默认路线仍把约束与完成含义主要封装在自由文本 request 中，尚未形成完整、稳定的 Task Request 字段模型。
 - 当前实现会在执行前保存任务并分配 Workflow ID，已经满足 RUN-001 与 RUN-003 的基本方向。
-- 当前 Controller 已把语义边界提交到独立于 Workspace 的本地 Git，并拒绝静默改写已提交的 `task.md` / `result.md`；Codex 压缩生命周期 hook 与进程中断后的 Workflow 恢复仍未实现。
+- 当前 Controller 已把语义边界提交到独立于 Workspace 的本地 Git，并拒绝静默改写已提交的 `task.md` / `result.md`；已实现 `PreCompact` Journal Checkpoint、compact 后完整 Task/Journal 重载，以及用相同 `workflow_id` 和持久 Codex thread 从 Controller 进程中断后继续。
 - 当前候选实现已有显式 `single_worker` fast path；Worker 请求升级或独立 Verification 拒绝结果时，会返回可机读的 Orchestrator 重试建议，由 Interactive Implementation 自动重试。Backend 尚不在同一个 Workflow Run 内续跑完整路线。
 - 当前 SQLite 状态层会原子写入 Terminal Outcome 与对应事件，并拒绝后续终态覆盖；竞争信号的完整 conformance 测试仍未建立。
 - 当前 `usage` 汇总每个 Agent thread 的最新累计 SDK usage snapshot；同一 thread 恢复后的新 snapshot 会替代旧 snapshot。`input_tokens` 因而包含多轮工具调用重复处理或命中缓存的上下文，不等于唯一上下文大小。

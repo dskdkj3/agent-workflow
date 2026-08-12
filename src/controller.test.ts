@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -25,7 +26,10 @@ import {
   type AgentUsage,
   type ModelProfile,
 } from "./contracts.js";
-import { WorkflowController } from "./controller.js";
+import {
+  WorkflowController,
+  WorkflowInterruptedError,
+} from "./controller.js";
 
 interface FakeStep {
   kind: "start" | "continue";
@@ -33,6 +37,7 @@ interface FakeStep {
   output?: unknown;
   usage?: AgentUsage | null;
   error?: Error;
+  startedBeforeError?: boolean;
   journal?: string;
 }
 
@@ -96,6 +101,10 @@ class FakeAgentRunner implements AgentRunner {
     const step = this.steps.shift();
     assert.ok(step, `Missing fake ${expectedKind} step`);
     assert.equal(step.kind, expectedKind);
+    if (step.startedBeforeError) {
+      assert.ok(step.threadId, `Interrupted ${expectedKind} step needs a thread ID`);
+      request.onThreadStarted?.(step.threadId);
+    }
     if (step.error) {
       throw step.error;
     }
@@ -174,6 +183,81 @@ function createFixture(): {
 
 function mode(path: string): number {
   return statSync(path).mode & 0o777;
+}
+
+function readyPlan(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    status: "ready",
+    summary: "Delegation is ready",
+    worker_task: "Implement the requested fixture change",
+    worker_profile: "luna_max",
+    verifier_profile: "terra_high",
+    completion_criteria: ["The fixture change is present"],
+    questions: [],
+    blocker: null,
+    ...overrides,
+  };
+}
+
+function completedWorker(summary = "Worker completed the fixture change") {
+  return {
+    status: "completed",
+    summary,
+    result_path: null,
+    questions: [],
+    blocker: null,
+  };
+}
+
+function passedVerification(summary = "Independent verification passed") {
+  return {
+    status: "passed",
+    summary,
+    findings: [],
+    result_path: null,
+    questions: [],
+    blocker: null,
+  };
+}
+
+function finalCompletion(summary = "Verified the fixture change") {
+  return {
+    status: "completed",
+    summary,
+    result_path: null,
+    questions: [],
+    blocker: null,
+  };
+}
+
+async function expectInterruptedRun(
+  fixture: ReturnType<typeof createFixture>,
+  workflowId: string,
+  steps: FakeStep[],
+  input: Record<string, unknown> = {},
+): Promise<void> {
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: new FakeAgentRunner(steps),
+    leaseMs: 20,
+  });
+  try {
+    await assert.rejects(
+      controller.run({
+        workflow_id: workflowId,
+        request: "Recover one fixture workflow",
+        workspace: fixture.workspace,
+        ...input,
+      }),
+      WorkflowInterruptedError,
+    );
+    assert.equal(controller.store.getStoredWorkflow(workflowId)?.status, "running");
+  } finally {
+    controller.close();
+  }
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
 }
 
 test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists the result", async (t) => {
@@ -397,7 +481,12 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
   assert.deepEqual(
     events
       .map((event) => event.type)
-      .filter((type) => type !== "checkpoint.committed"),
+      .filter(
+        (type) =>
+          type !== "checkpoint.committed" &&
+          type !== "agent.thread_started" &&
+          type !== "orchestrator.finalizing",
+      ),
     [
       "workflow.started",
       "orchestrator.planned",
@@ -824,7 +913,10 @@ test("converts a runner failure into a failed workflow", async (t) => {
   assert.deepEqual(
     eventTypes
       .map((event) => event.type)
-      .filter((type) => type !== "checkpoint.committed"),
+      .filter(
+        (type) =>
+          type !== "checkpoint.committed" && type !== "agent.thread_started",
+      ),
     [
       "workflow.started",
       "orchestrator.planned",
@@ -832,4 +924,464 @@ test("converts a runner failure into a failed workflow", async (t) => {
       "workflow.terminal",
     ],
   );
+});
+
+test("resumes an interrupted Orchestrator planning turn", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  await expectInterruptedRun(fixture, workflowId, [
+    {
+      kind: "start",
+      threadId: "planning-thread",
+      startedBeforeError: true,
+      error: new WorkflowInterruptedError(),
+    },
+  ]);
+
+  const runner = new FakeAgentRunner([
+    {
+      kind: "continue",
+      threadId: "planning-thread",
+      output: readyPlan(),
+      usage: planUsage,
+    },
+    {
+      kind: "start",
+      threadId: "planning-worker",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "planning-verifier",
+      output: passedVerification(),
+      usage: verifierUsage,
+    },
+    {
+      kind: "continue",
+      threadId: "planning-thread",
+      output: finalCompletion(),
+      usage: orchestratorCumulativeUsage,
+    },
+  ]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+    leaseMs: 20,
+  });
+  t.after(() => controller.close());
+
+  const output = await controller.run({
+    workflow_id: workflowId,
+    request: "Recover one fixture workflow",
+    workspace: fixture.workspace,
+  });
+  assert.equal(output.status, "completed");
+  assert.equal(runner.calls[0]?.kind, "continue");
+  assert.match(runner.calls[0]?.prompt ?? "", /Controller process was interrupted/);
+  assert.equal(
+    controller.store.latestEvent(workflowId, "workflow.resumed")?.type,
+    "workflow.resumed",
+  );
+});
+
+test("resumes an interrupted Worker turn without rerunning the Orchestrator plan", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  await expectInterruptedRun(fixture, workflowId, [
+    {
+      kind: "start",
+      threadId: "worker-recovery-orchestrator",
+      output: readyPlan(),
+      usage: planUsage,
+    },
+    {
+      kind: "start",
+      threadId: "worker-recovery-thread",
+      startedBeforeError: true,
+      error: new WorkflowInterruptedError(),
+    },
+  ]);
+
+  const runner = new FakeAgentRunner([
+    {
+      kind: "continue",
+      threadId: "worker-recovery-thread",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "worker-recovery-verifier",
+      output: passedVerification(),
+      usage: verifierUsage,
+    },
+    {
+      kind: "continue",
+      threadId: "worker-recovery-orchestrator",
+      output: finalCompletion(),
+      usage: orchestratorCumulativeUsage,
+    },
+  ]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+    leaseMs: 20,
+  });
+  t.after(() => controller.close());
+
+  const output = await controller.run({
+    workflow_id: workflowId,
+    request: "Recover one fixture workflow",
+    workspace: fixture.workspace,
+  });
+  assert.equal(output.status, "completed");
+  assert.deepEqual(
+    runner.calls.map((call) => [call.kind, call.role]),
+    [
+      ["continue", "worker"],
+      ["start", "verifier"],
+      ["continue", "orchestrator"],
+    ],
+  );
+  assert.match(runner.calls[0]?.prompt ?? "", /Do not blindly repeat side effects/);
+});
+
+test("resumes an interrupted Verifier turn", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  await expectInterruptedRun(fixture, workflowId, [
+    {
+      kind: "start",
+      threadId: "verifier-recovery-orchestrator",
+      output: readyPlan(),
+      usage: planUsage,
+    },
+    {
+      kind: "start",
+      threadId: "verifier-recovery-worker",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "verifier-recovery-thread",
+      startedBeforeError: true,
+      error: new WorkflowInterruptedError(),
+    },
+  ]);
+
+  const runner = new FakeAgentRunner([
+    {
+      kind: "continue",
+      threadId: "verifier-recovery-thread",
+      output: passedVerification(),
+      usage: verifierUsage,
+    },
+    {
+      kind: "continue",
+      threadId: "verifier-recovery-orchestrator",
+      output: finalCompletion(),
+      usage: orchestratorCumulativeUsage,
+    },
+  ]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+    leaseMs: 20,
+  });
+  t.after(() => controller.close());
+
+  const output = await controller.run({
+    workflow_id: workflowId,
+    request: "Recover one fixture workflow",
+    workspace: fixture.workspace,
+  });
+  assert.equal(output.status, "completed");
+  assert.deepEqual(
+    runner.calls.map((call) => [call.kind, call.role]),
+    [
+      ["continue", "verifier"],
+      ["continue", "orchestrator"],
+    ],
+  );
+  assert.match(runner.calls[0]?.prompt ?? "", /independent Verification turn/);
+});
+
+test("resumes an interrupted final Orchestrator turn", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  await expectInterruptedRun(fixture, workflowId, [
+    {
+      kind: "start",
+      threadId: "final-recovery-orchestrator",
+      output: readyPlan(),
+      usage: planUsage,
+    },
+    {
+      kind: "start",
+      threadId: "final-recovery-worker",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "final-recovery-verifier",
+      output: passedVerification(),
+      usage: verifierUsage,
+    },
+    {
+      kind: "continue",
+      threadId: "final-recovery-orchestrator",
+      error: new WorkflowInterruptedError(),
+    },
+  ]);
+
+  const runner = new FakeAgentRunner([
+    {
+      kind: "continue",
+      threadId: "final-recovery-orchestrator",
+      output: finalCompletion(),
+      usage: orchestratorCumulativeUsage,
+    },
+  ]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+    leaseMs: 20,
+  });
+  t.after(() => controller.close());
+
+  const output = await controller.run({
+    workflow_id: workflowId,
+    request: "Recover one fixture workflow",
+    workspace: fixture.workspace,
+  });
+  assert.equal(output.status, "completed");
+  assert.equal(runner.calls.length, 1);
+  assert.match(runner.calls[0]?.prompt ?? "", /final judgment turn/);
+});
+
+test("resumes interrupted fast-path Worker and Verifier turns", async (t) => {
+  const fixture = createFixture();
+  const criteria = ["The bounded result is observable"];
+  const workerWorkflowId = randomUUID();
+  const verifierWorkflowId = randomUUID();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  await expectInterruptedRun(
+    fixture,
+    workerWorkflowId,
+    [
+      {
+        kind: "start",
+        threadId: "fast-recovery-worker",
+        startedBeforeError: true,
+        error: new WorkflowInterruptedError(),
+      },
+    ],
+    { execution_route: "single_worker", completion_criteria: criteria },
+  );
+  const workerRunner = new FakeAgentRunner([
+    {
+      kind: "continue",
+      threadId: "fast-recovery-worker",
+      output: completedWorker("Fast Worker recovered"),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "fast-recovery-worker-verifier",
+      output: passedVerification(),
+      usage: verifierUsage,
+    },
+  ]);
+  const workerController = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: workerRunner,
+    leaseMs: 20,
+  });
+  const workerOutput = await workerController.run({
+    workflow_id: workerWorkflowId,
+    request: "Recover one fixture workflow",
+    workspace: fixture.workspace,
+    execution_route: "single_worker",
+    completion_criteria: criteria,
+  });
+  assert.equal(workerOutput.status, "completed");
+  assert.match(workerRunner.calls[0]?.prompt ?? "", /bounded single-Worker turn/);
+  workerController.close();
+
+  await expectInterruptedRun(
+    fixture,
+    verifierWorkflowId,
+    [
+      {
+        kind: "start",
+        threadId: "fast-verifier-worker",
+        output: completedWorker(),
+        usage: workerUsage,
+      },
+      {
+        kind: "start",
+        threadId: "fast-recovery-verifier",
+        startedBeforeError: true,
+        error: new WorkflowInterruptedError(),
+      },
+    ],
+    { execution_route: "single_worker", completion_criteria: criteria },
+  );
+  const verifierRunner = new FakeAgentRunner([
+    {
+      kind: "continue",
+      threadId: "fast-recovery-verifier",
+      output: passedVerification(),
+      usage: verifierUsage,
+    },
+  ]);
+  const verifierController = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: verifierRunner,
+    leaseMs: 20,
+  });
+  const verifierOutput = await verifierController.run({
+    workflow_id: verifierWorkflowId,
+    request: "Recover one fixture workflow",
+    workspace: fixture.workspace,
+    execution_route: "single_worker",
+    completion_criteria: criteria,
+  });
+  assert.equal(verifierOutput.status, "completed");
+  assert.deepEqual(
+    verifierRunner.calls.map((call) => [call.kind, call.role]),
+    [["continue", "verifier"]],
+  );
+  verifierController.close();
+});
+
+test("returns an existing terminal outcome without another Agent call", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  const firstRunner = new FakeAgentRunner([
+    {
+      kind: "start",
+      threadId: "terminal-worker",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "terminal-verifier",
+      output: passedVerification(),
+      usage: verifierUsage,
+    },
+  ]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: firstRunner,
+  });
+  const input = {
+    workflow_id: workflowId,
+    request: "Return the same terminal result",
+    workspace: fixture.workspace,
+    execution_route: "single_worker" as const,
+    completion_criteria: ["The result is observable"],
+  };
+  const first = await controller.run(input);
+  controller.close();
+
+  const retryRunner = new FakeAgentRunner([]);
+  const retryController = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: retryRunner,
+  });
+  t.after(() => {
+    retryController.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+  const second = await retryController.run(input);
+  assert.deepEqual(second, first);
+  assert.equal(retryRunner.calls.length, 0);
+});
+
+test("rejects a reused workflow ID with different immutable input", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: new FakeAgentRunner([
+      {
+        kind: "start",
+        threadId: "identity-worker",
+        output: completedWorker(),
+        usage: workerUsage,
+      },
+      {
+        kind: "start",
+        threadId: "identity-verifier",
+        output: passedVerification(),
+        usage: verifierUsage,
+      },
+    ]),
+  });
+  t.after(() => {
+    controller.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+  await controller.run({
+    workflow_id: workflowId,
+    request: "Original request",
+    workspace: fixture.workspace,
+    execution_route: "single_worker",
+    completion_criteria: ["Original criterion"],
+  });
+  await assert.rejects(
+    controller.run({
+      workflow_id: workflowId,
+      request: "Changed request",
+      workspace: fixture.workspace,
+      execution_route: "single_worker",
+      completion_criteria: ["Original criterion"],
+    }),
+    /cannot be reused with different request/,
+  );
+});
+
+test("allows only one Controller lease holder for a running workflow", (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  const first = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: new FakeAgentRunner([]),
+  });
+  const second = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: new FakeAgentRunner([]),
+  });
+  t.after(() => {
+    first.close();
+    second.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+  first.store.createWorkflow(
+    workflowId,
+    "Lease one workflow",
+    fixture.workspace,
+    join(fixture.stateDir, "tasks", workflowId),
+    "orchestrated",
+    [],
+    emptyUsage(),
+  );
+  assert.equal(first.store.claimWorkflow(workflowId, "owner-a", 60_000), true);
+  assert.equal(second.store.claimWorkflow(workflowId, "owner-b", 60_000), false);
+  first.store.releaseWorkflow(workflowId, "owner-a");
+  assert.equal(second.store.claimWorkflow(workflowId, "owner-b", 60_000), true);
 });

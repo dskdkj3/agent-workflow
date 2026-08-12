@@ -14,6 +14,8 @@ This repository implements the standalone Workflow MCP described by the project 
 - The Verifier must start in a fresh thread, receive the original request plus artifact paths, and avoid the Worker journal unless resolving a specific contradiction.
 - Every Agent owns `task.md`, `journal.md`, and `result.md`; `task.md` and completed `result.md` are frozen. On the bounded fast path, the Controller may materialize the Agent's structured outcome into the final Journal and result instead of spending model turns on bookkeeping-only writes.
 - SQLite stores lifecycle state, route, events, and checkpoint commit IDs. Markdown artifacts store task narrative and handoff content; a separate local Git repository per workflow preserves semantic versions without touching the Workspace repository.
+- Callers SHOULD create and retain `workflow_id` before the first invocation. An identical retry with the same ID resumes a running Workflow or returns its existing Terminal Outcome; changed immutable input under the same ID is invalid.
+- Every Agent uses a persistent isolated `CODEX_HOME`. Persist `thread.started` immediately, resume that thread after Controller interruption, checkpoint Task and Journal on `PreCompact`, and reload complete Task and Journal on compact `SessionStart`. Do not duplicate the AGENTS instruction chain in compact hook context.
 - Keep detailed evidence outside model handoffs by default: pass compact structured summaries and paths, then load evidence on demand.
 
 ## Scope Boundaries

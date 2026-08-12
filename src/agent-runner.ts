@@ -3,6 +3,7 @@ import {
   type CodexOptions,
   type Thread,
   type ThreadOptions,
+  type ThreadEvent,
   type Usage,
 } from "@openai/codex-sdk";
 import { z } from "zod";
@@ -21,6 +22,8 @@ export interface AgentTurnRequest<T> {
   taskDir: string;
   prompt: string;
   schema: z.ZodType<T>;
+  codexHome?: string;
+  onThreadStarted?: (threadId: string) => void | Promise<void>;
   signal?: AbortSignal;
 }
 
@@ -134,7 +137,7 @@ function parseStructuredOutput<T>(text: string, schema: z.ZodType<T>): T {
 }
 
 export class CodexAgentRunner implements AgentRunner {
-  private readonly codexByProfile = new Map<ModelProfile, Codex>();
+  private readonly codexByProfile = new Map<string, Codex>();
   private readonly options: CodexAgentRunnerOptions;
   private readonly baseConfig: NonNullable<CodexOptions["config"]>;
 
@@ -144,7 +147,7 @@ export class CodexAgentRunner implements AgentRunner {
   }
 
   async start<T>(request: AgentTurnRequest<T>): Promise<AgentTurnResult<T>> {
-    const thread = this.codex(request.profile).startThread(
+    const thread = this.codex(request.profile, request.codexHome).startThread(
       this.threadOptions(request),
     );
     return this.run(thread, request);
@@ -153,7 +156,7 @@ export class CodexAgentRunner implements AgentRunner {
   async continue<T>(
     request: ContinueAgentTurnRequest<T>,
   ): Promise<AgentTurnResult<T>> {
-    const thread = this.codex(request.profile).resumeThread(
+    const thread = this.codex(request.profile, request.codexHome).resumeThread(
       request.threadId,
       this.threadOptions(request),
     );
@@ -174,8 +177,9 @@ export class CodexAgentRunner implements AgentRunner {
     };
   }
 
-  private codex(profileName: ModelProfile): Codex {
-    const existing = this.codexByProfile.get(profileName);
+  private codex(profileName: ModelProfile, codexHome?: string): Codex {
+    const key = `${profileName}\u0000${codexHome ?? ""}`;
+    const existing = this.codexByProfile.get(key);
     if (existing) {
       return existing;
     }
@@ -184,6 +188,15 @@ export class CodexAgentRunner implements AgentRunner {
     const codex = new Codex({
       ...(this.options.codexPath
         ? { codexPathOverride: this.options.codexPath }
+        : {}),
+      ...(codexHome
+        ? {
+            env: Object.fromEntries(
+              Object.entries({ ...process.env, CODEX_HOME: codexHome }).filter(
+                (entry): entry is [string, string] => entry[1] !== undefined,
+              ),
+            ),
+          }
         : {}),
       config: {
         ...this.baseConfig,
@@ -194,7 +207,7 @@ export class CodexAgentRunner implements AgentRunner {
         model_reasoning_effort: profile.reasoningEffort,
       },
     });
-    this.codexByProfile.set(profileName, codex);
+    this.codexByProfile.set(key, codex);
     return codex;
   }
 
@@ -202,18 +215,58 @@ export class CodexAgentRunner implements AgentRunner {
     thread: Thread,
     request: AgentTurnRequest<T>,
   ): Promise<AgentTurnResult<T>> {
-    const turn = await thread.run(request.prompt, {
+    const streamed = await thread.runStreamed(request.prompt, {
       outputSchema: z.toJSONSchema(request.schema),
       ...(request.signal ? { signal: request.signal } : {}),
     });
-    if (thread.id === null) {
-      throw new Error("Codex completed a turn without exposing a thread ID");
+    let threadId = thread.id;
+    let finalResponse = "";
+    let usage: Usage | null = null;
+    let completed = false;
+
+    for await (const event of streamed.events) {
+      await this.handleEvent(event, async (startedThreadId) => {
+        threadId = startedThreadId;
+        await request.onThreadStarted?.(startedThreadId);
+      });
+      if (
+        event.type === "item.completed" &&
+        event.item.type === "agent_message"
+      ) {
+        finalResponse = event.item.text;
+      } else if (event.type === "turn.completed") {
+        usage = event.usage;
+        completed = true;
+      } else if (event.type === "turn.failed") {
+        throw new Error(`Codex turn failed: ${event.error.message}`);
+      } else if (event.type === "error") {
+        throw new Error(`Codex stream failed: ${event.message}`);
+      }
+    }
+
+    if (threadId === null) {
+      throw new Error("Codex started a turn without exposing a thread ID");
+    }
+    if (!completed) {
+      throw new Error("Codex event stream ended before turn.completed");
+    }
+    if (finalResponse === "") {
+      throw new Error("Codex completed a turn without an agent response");
     }
 
     return {
-      threadId: thread.id,
-      output: parseStructuredOutput(turn.finalResponse, request.schema),
-      usage: normalizeUsage(turn.usage),
+      threadId,
+      output: parseStructuredOutput(finalResponse, request.schema),
+      usage: normalizeUsage(usage),
     };
+  }
+
+  private async handleEvent(
+    event: ThreadEvent,
+    onThreadStarted: (threadId: string) => void | Promise<void>,
+  ): Promise<void> {
+    if (event.type === "thread.started") {
+      await onThreadStarted(event.thread_id);
+    }
   }
 }

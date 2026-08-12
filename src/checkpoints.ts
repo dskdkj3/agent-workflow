@@ -8,12 +8,17 @@ import { join, relative, resolve, sep } from "node:path";
 
 const CHECKPOINT_PATH = /^(?:orchestrator|verifier|workers\/worker-[1-9][0-9]*)\/(?:task|journal|result)\.md$/;
 const IMMUTABLE_PATH = /\/(?:task|result)\.md$/;
+const RESULT_PATH = /\/result\.md$/;
 const CHECKPOINT_KIND = /^[a-z][a-z0-9._-]*$/;
 const COMMIT_ID = /^[0-9a-f]{40,64}$/;
 
 export interface CheckpointCommit {
   id: string;
   kind: string;
+}
+
+export interface CheckpointCommitOptions {
+  includeNewResults?: boolean;
 }
 
 export interface CheckpointRepositoryOptions {
@@ -78,13 +83,18 @@ export class CheckpointRepository {
     }
   }
 
-  commit(kind: string): CheckpointCommit {
+  commit(
+    kind: string,
+    options: CheckpointCommitOptions = {},
+  ): CheckpointCommit {
     if (!CHECKPOINT_KIND.test(kind)) {
       throw new Error(`Invalid checkpoint kind: ${kind}`);
     }
     this.initialize();
 
-    const currentFiles = this.collectCheckpointFiles();
+    const currentFiles = this.collectCheckpointFiles().filter(
+      (path) => options.includeNewResults !== false || !RESULT_PATH.test(path),
+    );
     const trackedFiles = this.git(["ls-files", "-z"])
       .split("\0")
       .filter((path) => path !== "");
@@ -148,6 +158,67 @@ export class CheckpointRepository {
     return this.git(["show", `${commitId}:${normalized}`]);
   }
 
+  hasFileAt(commitId: string, path: string): boolean {
+    if (!COMMIT_ID.test(commitId)) {
+      throw new Error(`Invalid checkpoint commit ID: ${commitId}`);
+    }
+    const normalized = posixPath(path);
+    if (!CHECKPOINT_PATH.test(normalized)) {
+      throw new Error(`Invalid checkpoint path: ${path}`);
+    }
+    return (
+      this.gitQuiet(["cat-file", "-e", `${commitId}:${normalized}`]) !== null
+    );
+  }
+
+  latestCommit(): CheckpointCommit | null {
+    this.initialize();
+    try {
+      const id = this.gitQuiet(["rev-parse", "--verify", "HEAD"]);
+      if (id === null) {
+        return null;
+      }
+      const subject = this.gitQuiet(["log", "-1", "--format=%s"]);
+      if (subject === null) {
+        return null;
+      }
+      const prefix = "checkpoint: ";
+      if (!COMMIT_ID.test(id) || !subject.startsWith(prefix)) {
+        return null;
+      }
+      const kind = subject.slice(prefix.length);
+      if (!CHECKPOINT_KIND.test(kind)) {
+        return null;
+      }
+      return { id: id.trim(), kind };
+    } catch {
+      return null;
+    }
+  }
+
+  findCommit(kind: string): CheckpointCommit | null {
+    if (!CHECKPOINT_KIND.test(kind)) {
+      throw new Error(`Invalid checkpoint kind: ${kind}`);
+    }
+    this.initialize();
+    const log = this.gitQuiet(["log", "--format=%H%x00%s"]);
+    if (log === null) {
+      return null;
+    }
+    for (const line of log.split("\n")) {
+      const separator = line.indexOf("\0");
+      if (separator === -1) {
+        continue;
+      }
+      const id = line.slice(0, separator);
+      const subject = line.slice(separator + 1);
+      if (subject === `checkpoint: ${kind}` && COMMIT_ID.test(id)) {
+        return { id, kind };
+      }
+    }
+    return null;
+  }
+
   private collectCheckpointFiles(directory = this.workTree): string[] {
     const files: string[] = [];
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -198,6 +269,28 @@ export class CheckpointRepository {
       throw new Error(`Checkpoint Git failed: ${commandDetail(error)}`, {
         cause: error,
       });
+    }
+  }
+
+  private gitQuiet(args: string[]): string | null {
+    try {
+      return execFileSync(
+        this.gitPath,
+        [
+          `--git-dir=${this.gitDir}`,
+          `--work-tree=${this.workTree}`,
+          "-c",
+          "core.hooksPath=/dev/null",
+          ...args,
+        ],
+        {
+          cwd: this.workTree,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        },
+      ).trim();
+    } catch {
+      return null;
     }
   }
 }

@@ -54,25 +54,29 @@ export function createAgentJournal(
     result: join(options.directory, "result.md"),
   };
 
-  writeFileSync(
-    paths.task,
-    `# Task\n\n` +
-      `- Workflow: \`${options.workflowId}\`\n` +
-      `- Role: \`${options.role}\`\n` +
-      `- Workspace: \`${options.workspace}\`\n\n` +
-      `## Objective\n\n${options.objective}\n\n` +
-      `## Completion criteria\n\n${markdownList(options.completionCriteria)}\n`,
-    { encoding: "utf8", flag: "wx" },
-  );
+  if (!existsSync(paths.task)) {
+    writeFileSync(
+      paths.task,
+      `# Task\n\n` +
+        `- Workflow: \`${options.workflowId}\`\n` +
+        `- Role: \`${options.role}\`\n` +
+        `- Workspace: \`${options.workspace}\`\n\n` +
+        `## Objective\n\n${options.objective}\n\n` +
+        `## Completion criteria\n\n${markdownList(options.completionCriteria)}\n`,
+      { encoding: "utf8", flag: "wx" },
+    );
+  }
   chmodSync(paths.task, 0o444);
 
-  writeFileSync(
-    paths.journal,
+  if (!existsSync(paths.journal)) {
+    writeFileSync(
+      paths.journal,
       `# Journal\n\n` +
-      `${INITIAL_JOURNAL_STATUS}\n\n` +
-      `Last updated: ${new Date().toISOString()}\n`,
-    { encoding: "utf8", flag: "wx" },
-  );
+        `${INITIAL_JOURNAL_STATUS}\n\n` +
+        `Last updated: ${new Date().toISOString()}\n`,
+      { encoding: "utf8", flag: "wx" },
+    );
+  }
 
   return paths;
 }
@@ -103,6 +107,15 @@ export function ensureFrozenResult(
   role: AgentRole,
   outcome: JournalOutcome,
 ): void {
+  ensureResult(path, role, outcome);
+  freezeResult(path);
+}
+
+export function ensureResult(
+  path: string,
+  role: AgentRole,
+  outcome: JournalOutcome,
+): void {
   if (!existsSync(path)) {
     const questions = markdownList(outcome.questions);
     writeFileSync(
@@ -116,10 +129,14 @@ export function ensureFrozenResult(
       "utf8",
     );
   }
-  chmodSync(path, 0o444);
 }
 
 export function ensureFrozenFailureResult(path: string, message: string): void {
+  ensureFailureResult(path, message);
+  freezeResult(path);
+}
+
+export function ensureFailureResult(path: string, message: string): void {
   if (!existsSync(path)) {
     writeFileSync(
       path,
@@ -127,10 +144,17 @@ export function ensureFrozenFailureResult(path: string, message: string): void {
       "utf8",
     );
   }
-  chmodSync(path, 0o444);
 }
 
 export function ensureFrozenVerificationResult(
+  path: string,
+  outcome: VerificationOutcome,
+): void {
+  ensureVerificationResult(path, outcome);
+  freezeResult(path);
+}
+
+export function ensureVerificationResult(
   path: string,
   outcome: VerificationOutcome,
 ): void {
@@ -156,5 +180,8 @@ export function ensureFrozenVerificationResult(
       "utf8",
     );
   }
+}
+
+export function freezeResult(path: string): void {
   chmodSync(path, 0o444);
 }

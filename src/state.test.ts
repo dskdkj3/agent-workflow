@@ -79,6 +79,15 @@ test("migrates legacy agent runs to the historical sol_high profile", (t) => {
   assert.ok(workflowRouteColumn);
   assert.equal(workflowRouteColumn.notnull, 1);
   assert.equal(workflowRouteColumn.dflt_value, "'orchestrated'");
+
+  const workflowColumns = new Set(
+    (store.database.prepare("PRAGMA table_info(workflows)").all() as {
+      name: string;
+    }[]).map((candidate) => candidate.name),
+  );
+  assert.equal(workflowColumns.has("completion_criteria_json"), true);
+  assert.equal(workflowColumns.has("lease_owner"), true);
+  assert.equal(workflowColumns.has("lease_expires_at"), true);
 });
 
 test("stores exactly one terminal outcome and matching terminal event", (t) => {
@@ -97,6 +106,7 @@ test("stores exactly one terminal outcome and matching terminal event", (t) => {
     "/tmp/workspace",
     "/tmp/task",
     "orchestrated",
+    [],
     usage,
   );
   const completed: WorkflowRunOutput = {

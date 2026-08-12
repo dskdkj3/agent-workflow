@@ -124,6 +124,7 @@ export type VerificationOutcome = z.infer<typeof verificationOutcomeSchema>;
 
 export const workflowRunInputSchema = z
   .object({
+    workflow_id: z.string().uuid().optional(),
     request: z.string().trim().min(1).max(100_000),
     workspace: z.string().trim().min(1).optional(),
     execution_route: executionRouteSchema.default("orchestrated"),
