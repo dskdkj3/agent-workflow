@@ -3,17 +3,22 @@ import { mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import type { AgentRunner } from "./agent-runner.js";
+import { CheckpointRepository } from "./checkpoints.js";
 import {
   addUsage,
   agentOutcomeSchema,
   emptyUsage,
+  fastWorkerOutcomeSchema,
   orchestrationPlanSchema,
   verificationOutcomeSchema,
   workflowRunInputSchema,
   workflowRunOutputSchema,
   type AgentOutcome,
   type AgentUsage,
+  type ExecutionRoute,
+  type FastWorkerOutcome,
   type ModelProfile,
+  type ParsedWorkflowRunInput,
   type VerificationOutcome,
   type WorkflowRunInput,
   type WorkflowRunOutput,
@@ -23,10 +28,12 @@ import {
   ensureFrozenFailureResult,
   ensureFrozenResult,
   ensureFrozenVerificationResult,
+  ensureStructuredJournal,
   type AgentJournalPaths,
 } from "./journal.js";
 import {
   finalOrchestratorPrompt,
+  fastWorkerPrompt,
   initialOrchestratorPrompt,
   verifierPrompt,
   workerPrompt,
@@ -36,9 +43,12 @@ import { StateStore } from "./state.js";
 export interface WorkflowControllerOptions {
   stateDir: string;
   runner: AgentRunner;
+  gitPath?: string;
 }
 
 const ORCHESTRATOR_PROFILE: ModelProfile = "sol_high";
+const FAST_WORKER_PROFILE: ModelProfile = "luna_max";
+const FAST_VERIFIER_PROFILE: ModelProfile = "luna_max";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -64,16 +74,31 @@ function normalizedVerificationOutcome(
   };
 }
 
+function normalizedFastOutcome(
+  outcome: FastWorkerOutcome,
+  resultPath: string,
+): FastWorkerOutcome {
+  return {
+    ...outcome,
+    result_path: resultPath,
+  };
+}
+
 export class WorkflowController {
   readonly stateDir: string;
   readonly store: StateStore;
+  private readonly checkpointsDir: string;
+  private readonly gitPath: string;
   private readonly tasksDir: string;
   private readonly runner: AgentRunner;
 
   constructor(options: WorkflowControllerOptions) {
     this.stateDir = resolve(options.stateDir);
     this.tasksDir = join(this.stateDir, "tasks");
+    this.checkpointsDir = join(this.stateDir, "checkpoints");
+    this.gitPath = options.gitPath ?? "git";
     mkdirSync(this.tasksDir, { recursive: true });
+    mkdirSync(this.checkpointsDir, { recursive: true });
     this.store = new StateStore(join(this.stateDir, "controller.sqlite3"));
     this.runner = options.runner;
   }
@@ -91,9 +116,17 @@ export class WorkflowController {
     if (!statSync(workspace).isDirectory()) {
       throw new Error(`Workspace is not a directory: ${workspace}`);
     }
+    if (input.execution_route === "single_worker") {
+      return this.runSingleWorker(input, workspace, signal);
+    }
 
     const workflowId = randomUUID();
     const workflowTaskDir = join(this.tasksDir, workflowId);
+    const checkpointRepository = new CheckpointRepository({
+      workTree: workflowTaskDir,
+      gitDir: join(this.checkpointsDir, `${workflowId}.git`),
+      gitPath: this.gitPath,
+    });
     const orchestratorJournal = createAgentJournal({
       directory: join(workflowTaskDir, "orchestrator"),
       role: "orchestrator",
@@ -115,11 +148,13 @@ export class WorkflowController {
       input.request,
       workspace,
       workflowTaskDir,
+      input.execution_route,
       totalUsage,
     );
     this.store.appendEvent(workflowId, null, "workflow.started", {
       workspace,
       task_dir: workflowTaskDir,
+      execution_route: input.execution_route,
     });
 
     const orchestratorRunId = randomUUID();
@@ -141,6 +176,12 @@ export class WorkflowController {
     let verifierUsage = emptyUsage();
 
     try {
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        orchestratorRunId,
+        "workflow.accepted",
+      );
       const planTurn = await this.runner.start({
         role: "orchestrator",
         profile: ORCHESTRATOR_PROFILE,
@@ -163,6 +204,12 @@ export class WorkflowController {
         outcome: planTurn.output,
         usage: planTurn.usage,
       });
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        orchestratorRunId,
+        "orchestrator.planned",
+      );
 
       if (planTurn.output.status !== "ready") {
         const earlyOutcome = normalizedOutcome(
@@ -186,6 +233,12 @@ export class WorkflowController {
           orchestratorUsage,
         );
         orchestratorFinished = true;
+        this.commitCheckpoint(
+          checkpointRepository,
+          workflowId,
+          orchestratorRunId,
+          `workflow.${earlyOutcome.status}`,
+        );
         return this.finishWorkflow(
           workflowId,
           workflowTaskDir,
@@ -229,6 +282,12 @@ export class WorkflowController {
         profile: workerProfile,
         taskDir: workerJournal.directory,
       });
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        currentWorkerRunId,
+        "worker.dispatched",
+      );
 
       const workerTurn = await this.runner.start({
         role: "worker",
@@ -254,6 +313,12 @@ export class WorkflowController {
         outcome: workerOutcome,
         usage: workerTurn.usage,
       });
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        currentWorkerRunId,
+        "worker.completed",
+      );
 
       let verifierJournal: AgentJournalPaths | null = null;
       let verifierOutcome: VerificationOutcome | null = null;
@@ -281,6 +346,12 @@ export class WorkflowController {
           profile: verifierProfile,
           taskDir: verifierJournal.directory,
         });
+        this.commitCheckpoint(
+          checkpointRepository,
+          workflowId,
+          currentVerifierRunId,
+          "verifier.dispatched",
+        );
 
         const verifierTurn = await this.runner.start({
           role: "verifier",
@@ -323,6 +394,12 @@ export class WorkflowController {
             outcome: verifierOutcome,
             usage: verifierTurn.usage,
           },
+        );
+        this.commitCheckpoint(
+          checkpointRepository,
+          workflowId,
+          currentVerifierRunId,
+          "verifier.completed",
         );
       }
 
@@ -384,6 +461,12 @@ export class WorkflowController {
           usage: finalTurn.usage,
         },
       );
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        orchestratorRunId,
+        "orchestrator.completed",
+      );
 
       return this.finishWorkflow(
         workflowId,
@@ -415,23 +498,370 @@ export class WorkflowController {
         );
       }
       ensureFrozenFailureResult(orchestratorJournal.result, message);
-      this.store.appendEvent(workflowId, null, "workflow.failed", {
+      this.store.appendEvent(workflowId, null, "workflow.execution_failed", {
         error: message,
         orchestrator_thread_id: orchestratorThreadId,
       });
+      try {
+        this.commitCheckpoint(
+          checkpointRepository,
+          workflowId,
+          null,
+          "workflow.failed",
+        );
+      } catch (checkpointError) {
+        this.store.appendEvent(workflowId, null, "checkpoint.failed", {
+          error: errorMessage(checkpointError),
+        });
+      }
 
-      const output = workflowRunOutputSchema.parse({
-        workflow_id: workflowId,
-        status: "failed",
-        summary: message,
-        task_dir: workflowTaskDir,
-        result_path: orchestratorJournal.result,
-        questions: [],
-        blocker: message,
-        usage: totalUsage,
+      return this.finishWorkflow(
+        workflowId,
+        workflowTaskDir,
+        {
+          status: "failed",
+          summary: message,
+          result_path: orchestratorJournal.result,
+          questions: [],
+          blocker: message,
+        },
+        totalUsage,
+      );
+    }
+  }
+
+  private async runSingleWorker(
+    input: ParsedWorkflowRunInput,
+    workspace: string,
+    signal?: AbortSignal,
+  ): Promise<WorkflowRunOutput> {
+    const workflowId = randomUUID();
+    const workflowTaskDir = join(this.tasksDir, workflowId);
+    const checkpointRepository = new CheckpointRepository({
+      workTree: workflowTaskDir,
+      gitDir: join(this.checkpointsDir, `${workflowId}.git`),
+      gitPath: this.gitPath,
+    });
+    const workerJournal = createAgentJournal({
+      directory: join(workflowTaskDir, "workers", "worker-1"),
+      role: "worker",
+      workflowId,
+      workspace,
+      objective: input.request,
+      completionCriteria: input.completion_criteria,
+    });
+
+    let totalUsage = emptyUsage();
+    let workerUsage = emptyUsage();
+    let verifierUsage = emptyUsage();
+    this.store.createWorkflow(
+      workflowId,
+      input.request,
+      workspace,
+      workflowTaskDir,
+      input.execution_route,
+      totalUsage,
+    );
+    this.store.appendEvent(workflowId, null, "workflow.started", {
+      workspace,
+      task_dir: workflowTaskDir,
+      execution_route: input.execution_route,
+    });
+
+    const workerRunId = randomUUID();
+    this.store.createAgentRun({
+      id: workerRunId,
+      workflowId,
+      parentRunId: null,
+      role: "worker",
+      profile: FAST_WORKER_PROFILE,
+      taskDir: workerJournal.directory,
+    });
+
+    let workerFinished = false;
+    let verifierFinished = false;
+    let verifierRunId: string | null = null;
+    let verifierJournal: AgentJournalPaths | null = null;
+
+    try {
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        workerRunId,
+        "workflow.accepted",
+      );
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        workerRunId,
+        "worker.dispatched",
+      );
+      const workerTurn = await this.runner.start({
+        role: "worker",
+        profile: FAST_WORKER_PROFILE,
+        workspace,
+        taskDir: workerJournal.directory,
+        prompt: fastWorkerPrompt({ workspace, journal: workerJournal }),
+        schema: fastWorkerOutcomeSchema,
+        ...(signal ? { signal } : {}),
       });
-      this.store.finishWorkflow(output);
-      return output;
+      this.store.setAgentThread(workerRunId, workerTurn.threadId);
+      workerUsage = addUsage(workerUsage, workerTurn.usage);
+      totalUsage = addUsage(totalUsage, workerTurn.usage);
+      const workerOutcome = normalizedFastOutcome(
+        workerTurn.output,
+        workerJournal.result,
+      );
+      ensureStructuredJournal(workerJournal.journal, workerOutcome);
+      ensureFrozenResult(workerJournal.result, "worker", workerOutcome);
+      this.store.finishAgentRun(workerRunId, "completed", workerUsage);
+      workerFinished = true;
+      this.store.appendEvent(workflowId, workerRunId, "worker.completed", {
+        thread_id: workerTurn.threadId,
+        outcome: workerOutcome,
+        usage: workerTurn.usage,
+      });
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        workerRunId,
+        "worker.completed",
+      );
+
+      if (workerOutcome.status !== "completed") {
+        const retryRoute =
+          workerOutcome.status === "escalate" ? "orchestrated" : null;
+        const terminalOutcome: AgentOutcome = {
+          status:
+            workerOutcome.status === "escalate"
+              ? "failed"
+              : workerOutcome.status,
+          summary:
+            workerOutcome.status === "escalate"
+              ? `Single-Worker route requires orchestration: ${workerOutcome.summary}`
+              : workerOutcome.summary,
+          result_path: workerJournal.result,
+          questions: workerOutcome.questions,
+          blocker:
+            workerOutcome.status === "escalate"
+              ? "route_escalation_required"
+              : workerOutcome.blocker,
+        };
+        this.commitCheckpoint(
+          checkpointRepository,
+          workflowId,
+          workerRunId,
+          workerOutcome.status === "escalate"
+            ? "workflow.escalated"
+            : `workflow.${terminalOutcome.status}`,
+        );
+        return this.finishWorkflow(
+          workflowId,
+          workflowTaskDir,
+          terminalOutcome,
+          totalUsage,
+          "single_worker",
+          retryRoute,
+        );
+      }
+
+      verifierJournal = createAgentJournal({
+        directory: join(workflowTaskDir, "verifier"),
+        role: "verifier",
+        workflowId,
+        workspace,
+        objective:
+          "Independently verify the single-Worker result against the original request.",
+        completionCriteria: [
+          ...input.completion_criteria,
+          "Report only evidence-backed material findings.",
+          "Do not modify the implementation under verification.",
+        ],
+      });
+      const currentVerifierRunId = randomUUID();
+      verifierRunId = currentVerifierRunId;
+      this.store.createAgentRun({
+        id: currentVerifierRunId,
+        workflowId,
+        parentRunId: workerRunId,
+        role: "verifier",
+        profile: FAST_VERIFIER_PROFILE,
+        taskDir: verifierJournal.directory,
+      });
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        currentVerifierRunId,
+        "verifier.dispatched",
+      );
+
+      const verifierTurn = await this.runner.start({
+        role: "verifier",
+        profile: FAST_VERIFIER_PROFILE,
+        workspace,
+        taskDir: verifierJournal.directory,
+        prompt: verifierPrompt({
+          request: input.request,
+          workspace,
+          journal: verifierJournal,
+          workerJournal,
+          completionCriteria: input.completion_criteria,
+          compactArtifacts: true,
+        }),
+        schema: verificationOutcomeSchema,
+        ...(signal ? { signal } : {}),
+      });
+      this.store.setAgentThread(currentVerifierRunId, verifierTurn.threadId);
+      verifierUsage = addUsage(verifierUsage, verifierTurn.usage);
+      totalUsage = addUsage(totalUsage, verifierTurn.usage);
+      const verifierOutcome = normalizedVerificationOutcome(
+        verifierTurn.output,
+        verifierJournal.result,
+      );
+      ensureStructuredJournal(verifierJournal.journal, verifierOutcome);
+      ensureFrozenVerificationResult(
+        verifierJournal.result,
+        verifierOutcome,
+      );
+      this.store.finishAgentRun(
+        currentVerifierRunId,
+        "completed",
+        verifierUsage,
+      );
+      verifierFinished = true;
+      this.store.appendEvent(
+        workflowId,
+        currentVerifierRunId,
+        "verifier.completed",
+        {
+          thread_id: verifierTurn.threadId,
+          outcome: verifierOutcome,
+          usage: verifierTurn.usage,
+        },
+      );
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        currentVerifierRunId,
+        "verifier.completed",
+      );
+
+      let terminalOutcome: AgentOutcome;
+      switch (verifierOutcome.status) {
+        case "passed":
+          terminalOutcome = {
+            status: "completed",
+            summary: `${workerOutcome.summary} ${verifierOutcome.summary}`,
+            result_path: workerJournal.result,
+            questions: [],
+            blocker: null,
+          };
+          break;
+        case "findings":
+          terminalOutcome = {
+            status: "failed",
+            summary: verifierOutcome.summary,
+            result_path: verifierJournal.result,
+            questions: [],
+            blocker:
+              verifierOutcome.findings.map((finding) => finding.issue).join("; ") ||
+              "Independent verification found a material issue",
+          };
+          break;
+        case "needs_input":
+          terminalOutcome = {
+            status: "needs_input",
+            summary: verifierOutcome.summary,
+            result_path: verifierJournal.result,
+            questions: verifierOutcome.questions,
+            blocker: verifierOutcome.blocker,
+          };
+          break;
+        case "blocked":
+          terminalOutcome = {
+            status: "blocked",
+            summary: verifierOutcome.summary,
+            result_path: verifierJournal.result,
+            questions: verifierOutcome.questions,
+            blocker: verifierOutcome.blocker,
+          };
+          break;
+      }
+
+      const retryRoute =
+        verifierOutcome.status === "findings" ? "orchestrated" : null;
+      this.commitCheckpoint(
+        checkpointRepository,
+        workflowId,
+        currentVerifierRunId,
+        retryRoute === null
+          ? `workflow.${terminalOutcome.status}`
+          : "workflow.escalated",
+      );
+      return this.finishWorkflow(
+        workflowId,
+        workflowTaskDir,
+        terminalOutcome,
+        totalUsage,
+        "single_worker",
+        retryRoute,
+      );
+    } catch (error) {
+      const message = signal?.aborted
+        ? "Workflow execution was cancelled"
+        : errorMessage(error);
+      if (!workerFinished) {
+        this.store.finishAgentRun(workerRunId, "failed", workerUsage, message);
+      }
+      if (verifierRunId !== null && !verifierFinished) {
+        this.store.finishAgentRun(
+          verifierRunId,
+          "failed",
+          verifierUsage,
+          message,
+        );
+      }
+      const resultPath = verifierJournal?.result ?? workerJournal.result;
+      ensureStructuredJournal(
+        verifierJournal?.journal ?? workerJournal.journal,
+        {
+          status: "failed",
+          summary: message,
+          questions: [],
+          blocker: message,
+        },
+      );
+      ensureFrozenFailureResult(resultPath, message);
+      this.store.appendEvent(workflowId, null, "workflow.execution_failed", {
+        error: message,
+        execution_route: "single_worker",
+      });
+      try {
+        this.commitCheckpoint(
+          checkpointRepository,
+          workflowId,
+          null,
+          "workflow.failed",
+        );
+      } catch (checkpointError) {
+        this.store.appendEvent(workflowId, null, "checkpoint.failed", {
+          error: errorMessage(checkpointError),
+        });
+      }
+
+      return this.finishWorkflow(
+        workflowId,
+        workflowTaskDir,
+        {
+          status: "failed",
+          summary: message,
+          result_path: resultPath,
+          questions: [],
+          blocker: message,
+        },
+        totalUsage,
+        "single_worker",
+      );
     }
   }
 
@@ -440,6 +870,8 @@ export class WorkflowController {
     workflowTaskDir: string,
     outcome: AgentOutcome,
     usage: AgentUsage,
+    executionRoute: ExecutionRoute = "orchestrated",
+    retryRoute: "orchestrated" | null = null,
   ): WorkflowRunOutput {
     const output = workflowRunOutputSchema.parse({
       workflow_id: workflowId,
@@ -450,9 +882,29 @@ export class WorkflowController {
       questions: outcome.questions,
       blocker: outcome.blocker,
       usage,
+      execution_route: executionRoute,
+      retry_route: retryRoute,
     });
     this.store.finishWorkflow(output);
-    this.store.appendEvent(workflowId, null, "workflow.completed", output);
     return output;
+  }
+
+  private commitCheckpoint(
+    repository: CheckpointRepository,
+    workflowId: string,
+    runId: string | null,
+    kind: string,
+  ): void {
+    const checkpoint = repository.commit(kind);
+    this.store.recordCheckpoint(
+      workflowId,
+      runId,
+      checkpoint.kind,
+      checkpoint.id,
+    );
+    this.store.appendEvent(workflowId, runId, "checkpoint.committed", {
+      kind: checkpoint.kind,
+      commit_id: checkpoint.id,
+    });
   }
 }

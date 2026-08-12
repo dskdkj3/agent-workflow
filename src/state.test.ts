@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import { emptyUsage, type WorkflowRunOutput } from "./contracts.js";
 import { StateStore } from "./state.js";
 
 test("migrates legacy agent runs to the historical sol_high profile", (t) => {
@@ -12,6 +13,20 @@ test("migrates legacy agent runs to the historical sol_high profile", (t) => {
   const databasePath = join(root, "controller.sqlite3");
   const legacy = new DatabaseSync(databasePath);
   legacy.exec(`
+    CREATE TABLE workflows (
+      id TEXT PRIMARY KEY,
+      request TEXT NOT NULL,
+      workspace TEXT NOT NULL,
+      task_dir TEXT NOT NULL,
+      status TEXT NOT NULL,
+      summary TEXT,
+      result_path TEXT,
+      questions_json TEXT NOT NULL DEFAULT '[]',
+      blocker TEXT,
+      usage_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
     CREATE TABLE agent_runs (
       id TEXT PRIMARY KEY,
       workflow_id TEXT NOT NULL,
@@ -54,4 +69,70 @@ test("migrates legacy agent runs to the historical sol_high profile", (t) => {
   assert.ok(column);
   assert.equal(column.notnull, 1);
   assert.equal(column.dflt_value, "'sol_high'");
+
+  const workflowRouteColumn = store.database
+    .prepare("PRAGMA table_info(workflows)")
+    .all()
+    .find((candidate) => candidate.name === "execution_route") as
+    | { notnull: number; dflt_value: string | null }
+    | undefined;
+  assert.ok(workflowRouteColumn);
+  assert.equal(workflowRouteColumn.notnull, 1);
+  assert.equal(workflowRouteColumn.dflt_value, "'orchestrated'");
+});
+
+test("stores exactly one terminal outcome and matching terminal event", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "agent-workflow-terminal-"));
+  const store = new StateStore(join(root, "controller.sqlite3"));
+  t.after(() => {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const workflowId = "00000000-0000-4000-8000-000000000001";
+  const usage = emptyUsage();
+  store.createWorkflow(
+    workflowId,
+    "Complete one task",
+    "/tmp/workspace",
+    "/tmp/task",
+    "orchestrated",
+    usage,
+  );
+  const completed: WorkflowRunOutput = {
+    workflow_id: workflowId,
+    status: "completed",
+    summary: "The task is complete",
+    task_dir: "/tmp/task",
+    result_path: "/tmp/task/orchestrator/result.md",
+    questions: [],
+    blocker: null,
+    usage,
+    execution_route: "orchestrated",
+    retry_route: null,
+  };
+  store.finishWorkflow(completed);
+
+  const competingFailure: WorkflowRunOutput = {
+    ...completed,
+    status: "failed",
+    summary: "A late failure tried to replace completion",
+    blocker: "late failure",
+  };
+  assert.throws(
+    () => store.finishWorkflow(competingFailure),
+    /already has terminal outcome completed/,
+  );
+  assert.equal(store.getWorkflow(workflowId)?.status, "completed");
+
+  const terminalEvents = store.database
+    .prepare(
+      "SELECT payload_json FROM events WHERE workflow_id = ? AND type = 'workflow.terminal'",
+    )
+    .all(workflowId) as { payload_json: string }[];
+  assert.equal(terminalEvents.length, 1);
+  assert.equal(
+    JSON.parse(terminalEvents[0]?.payload_json ?? "{}").status,
+    "completed",
+  );
 });

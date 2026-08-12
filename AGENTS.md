@@ -6,14 +6,14 @@ This repository implements the standalone Workflow MCP described by the project 
 
 - MCP protocol target: modern `2026-07-28`; the stdio entry must also serve the `2025-06-18` initialize handshake used by current Codex clients.
 - Public surface: one synchronous tool, `workflow.run`.
-- Execution path: one `sol_high` Orchestrator thread, one routed Generic Worker thread, one fresh-context independent Verifier thread, then the same Orchestrator thread judges and finalizes.
+- Execution routes: the default path is one `sol_high` Orchestrator, one routed Generic Worker, a fresh-context independent Verifier, then the same Orchestrator finalizes; the explicit bounded fast path is one `luna_max` Worker plus one fresh `luna_max` Verifier, with Controller finalization.
 - Allowlisted model profiles are `luna_max`, `terra_high`, `sol_high`, and `sol_max`; preserve the real `max` effort through Codex config and never map it to `xhigh`.
 - Codex is behind an `AgentRunner` adapter. Do not couple Controller state or MCP schemas directly to Codex SDK internals.
 - Keep provider wiring outside the core; host integrations may inject generic Codex config through `AGENT_WORKFLOW_CODEX_CONFIG_JSON`.
 - Orchestrator, Worker, and Verifier must not use or generate Codex Memories and must not create subagents.
 - The Verifier must start in a fresh thread, receive the original request plus artifact paths, and avoid the Worker journal unless resolving a specific contradiction.
-- Every Agent owns `task.md`, `journal.md`, and `result.md`; `task.md` and completed `result.md` are frozen.
-- SQLite stores lifecycle state and events. Markdown artifacts store task narrative and handoff content.
+- Every Agent owns `task.md`, `journal.md`, and `result.md`; `task.md` and completed `result.md` are frozen. On the bounded fast path, the Controller may materialize the Agent's structured outcome into the final Journal and result instead of spending model turns on bookkeeping-only writes.
+- SQLite stores lifecycle state, route, events, and checkpoint commit IDs. Markdown artifacts store task narrative and handoff content; a separate local Git repository per workflow preserves semantic versions without touching the Workspace repository.
 - Keep detailed evidence outside model handoffs by default: pass compact structured summaries and paths, then load evidence on demand.
 
 ## Scope Boundaries

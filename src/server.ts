@@ -31,7 +31,7 @@ export function createWorkflowMcpServer(service: WorkflowService): McpServer {
     {
       title: "Run agent workflow",
       description:
-        "Run one synchronous workflow through a Sol Orchestrator, one routed Generic Worker, an independent Verifier, and final Orchestrator judgment.",
+        "Run one synchronous workflow through either the full Orchestrator route or an explicitly selected single-Worker fast path; both routes persist checkpoints and require independent verification before completion.",
       inputSchema: workflowRunInputSchema,
       outputSchema: workflowRunOutputSchema,
       annotations: {

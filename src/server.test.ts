@@ -31,6 +31,8 @@ function workflowOutput(
     result_path: "/tmp/agent-workflow-test/task/orchestrator/result.md",
     questions: [],
     blocker: null,
+    execution_route: "orchestrated",
+    retry_route: null,
     usage: {
       input_tokens: 1,
       cached_input_tokens: 0,
@@ -148,7 +150,12 @@ test("workflow.run exposes and returns validated structured output", async (t) =
   assert.equal(result.isError, false);
   assert.deepEqual(result.structuredContent, workflowOutput());
   assert.deepEqual(calls, [
-    { request: "run fixture", workspace: "/tmp/workspace" },
+    {
+      request: "run fixture",
+      workspace: "/tmp/workspace",
+      execution_route: "orchestrated",
+      completion_criteria: [],
+    },
   ]);
   assert.ok(
     result.content.some(

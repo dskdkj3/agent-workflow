@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   AgentRole,
   AgentUsage,
+  ExecutionRoute,
   ModelProfile,
   WorkflowRunOutput,
 } from "./contracts.js";
@@ -34,6 +35,7 @@ export class StateStore {
         request TEXT NOT NULL,
         workspace TEXT NOT NULL,
         task_dir TEXT NOT NULL,
+        execution_route TEXT NOT NULL DEFAULT 'orchestrated',
         status TEXT NOT NULL,
         summary TEXT,
         result_path TEXT,
@@ -67,8 +69,18 @@ export class StateStore {
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS checkpoints (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        workflow_id TEXT NOT NULL REFERENCES workflows(id),
+        run_id TEXT REFERENCES agent_runs(id),
+        kind TEXT NOT NULL,
+        commit_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
     this.ensureAgentRunProfileColumn();
+    this.ensureWorkflowExecutionRouteColumn();
   }
 
   close(): void {
@@ -80,36 +92,71 @@ export class StateStore {
     request: string,
     workspace: string,
     taskDir: string,
+    executionRoute: ExecutionRoute,
     usage: AgentUsage,
   ): void {
     const now = new Date().toISOString();
     this.database
       .prepare(`
         INSERT INTO workflows (
-          id, request, workspace, task_dir, status, usage_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
+          id, request, workspace, task_dir, execution_route, status,
+          usage_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
       `)
-      .run(id, request, workspace, taskDir, JSON.stringify(usage), now, now);
+      .run(
+        id,
+        request,
+        workspace,
+        taskDir,
+        executionRoute,
+        JSON.stringify(usage),
+        now,
+        now,
+      );
   }
 
   finishWorkflow(output: WorkflowRunOutput): void {
-    this.database
-      .prepare(`
-        UPDATE workflows
-        SET status = ?, summary = ?, result_path = ?, questions_json = ?, blocker = ?,
-            usage_json = ?, updated_at = ?
-        WHERE id = ?
-      `)
-      .run(
-        output.status,
-        output.summary,
-        output.result_path,
-        JSON.stringify(output.questions),
-        output.blocker,
-        JSON.stringify(output.usage),
-        new Date().toISOString(),
-        output.workflow_id,
-      );
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = this.database
+        .prepare(`
+          UPDATE workflows
+          SET status = ?, summary = ?, result_path = ?, questions_json = ?, blocker = ?,
+              usage_json = ?, updated_at = ?
+          WHERE id = ? AND status = 'running'
+        `)
+        .run(
+          output.status,
+          output.summary,
+          output.result_path,
+          JSON.stringify(output.questions),
+          output.blocker,
+          JSON.stringify(output.usage),
+          new Date().toISOString(),
+          output.workflow_id,
+        );
+      if (Number(updated.changes) !== 1) {
+        const existing = this.database
+          .prepare("SELECT status FROM workflows WHERE id = ?")
+          .get(output.workflow_id) as { status: string } | undefined;
+        if (existing === undefined) {
+          throw new Error(`Unknown workflow: ${output.workflow_id}`);
+        }
+        throw new Error(
+          `Workflow ${output.workflow_id} already has terminal outcome ${existing.status}`,
+        );
+      }
+
+      this.appendEvent(output.workflow_id, null, "workflow.terminal", output);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        // Preserve the original terminal-state failure.
+      }
+      throw error;
+    }
   }
 
   createAgentRun(input: CreateAgentRun): void {
@@ -171,6 +218,21 @@ export class StateStore {
       );
   }
 
+  recordCheckpoint(
+    workflowId: string,
+    runId: string | null,
+    kind: string,
+    commitId: string,
+  ): void {
+    this.database
+      .prepare(`
+        INSERT INTO checkpoints (
+          workflow_id, run_id, kind, commit_id, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `)
+      .run(workflowId, runId, kind, commitId, new Date().toISOString());
+  }
+
   getWorkflow(id: string): Record<string, unknown> | undefined {
     return this.database
       .prepare("SELECT * FROM workflows WHERE id = ?")
@@ -183,6 +245,14 @@ export class StateStore {
       .all(workflowId) as Record<string, unknown>[];
   }
 
+  listCheckpoints(workflowId: string): Record<string, unknown>[] {
+    return this.database
+      .prepare(
+        "SELECT * FROM checkpoints WHERE workflow_id = ? ORDER BY sequence",
+      )
+      .all(workflowId) as Record<string, unknown>[];
+  }
+
   private ensureAgentRunProfileColumn(): void {
     const columns = this.database
       .prepare("PRAGMA table_info(agent_runs)")
@@ -192,6 +262,17 @@ export class StateStore {
       // Preserve that historical fact while making the migrated column non-null.
       this.database.exec(
         "ALTER TABLE agent_runs ADD COLUMN profile TEXT NOT NULL DEFAULT 'sol_high'",
+      );
+    }
+  }
+
+  private ensureWorkflowExecutionRouteColumn(): void {
+    const columns = this.database
+      .prepare("PRAGMA table_info(workflows)")
+      .all() as { name: string }[];
+    if (!columns.some((column) => column.name === "execution_route")) {
+      this.database.exec(
+        "ALTER TABLE workflows ADD COLUMN execution_route TEXT NOT NULL DEFAULT 'orchestrated'",
       );
     }
   }

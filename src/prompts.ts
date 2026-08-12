@@ -61,15 +61,40 @@ The independent Verifier runs only after your turn finishes. Do not claim that i
 Do not create or message other agents. Do not contact the user. Return "needs_input" with concrete questions when information must travel through the Orchestrator and Interaction Agent. Return "blocked" for an objective blocker. Return only the JSON required by the output schema.`;
 }
 
+export function fastWorkerPrompt(options: WorkerPromptOptions): string {
+  return `You are the sole Generic Worker on a single-Worker fast path.
+
+The Interaction Agent selected this route only because the request was already bounded like an executable Worker task. Read the frozen task file completely, then execute it in the workspace:
+${options.journal.task}
+
+Workspace:
+${options.workspace}
+
+Batch related inspection, implementation, and verification work. Return a self-contained structured summary containing the current state, chosen approach, decisive evidence, and any unresolved issue. For this bounded route, do not spend tool calls editing ${options.journal.journal} or ${options.journal.result}; the Controller persists your structured outcome into both artifacts before the completion Checkpoint.
+
+Do not widen scope, invent missing user intent, or make a new architectural or product decision. Return "escalate" as soon as safe continuation requires decomposition, coordination, materially broader scope, or judgment that an Orchestrator should make. Return "needs_input" only when user information is genuinely required, "blocked" for an objective blocker, or "failed" for an execution failure. The independent Verifier runs only after your turn finishes. Return only the JSON required by the output schema.`;
+}
+
 interface VerifierPromptOptions {
   request: string;
   workspace: string;
   journal: AgentJournalPaths;
   workerJournal: AgentJournalPaths;
   completionCriteria: string[];
+  compactArtifacts?: boolean;
 }
 
 export function verifierPrompt(options: VerifierPromptOptions): string {
+  const artifactInstructions = options.compactArtifacts
+    ? `Return a self-contained structured summary containing the decisive evidence and judgment. For this bounded route, do not spend tool calls editing ${options.journal.journal} or ${options.journal.result}; the Controller persists your structured outcome into both artifacts before the completion Checkpoint.`
+    : `Maintain your current narrative journal when evidence or judgment changes:
+${options.journal.journal}
+
+Batch related independent checks and journal updates; do not narrate routine tool calls one by one.
+
+Before returning, write a self-contained verification result to:
+${options.journal.result}`;
+
   return `You are an independent Verifier in a fresh context. Challenge the result from an external evidence-first perspective. Do not implement fixes and do not modify source files.
 
 Read your frozen task file completely before acting:
@@ -94,11 +119,7 @@ Do not read the Worker journal or inherit its reasoning unless a specific contra
 
 Check whether the original goal was actually achieved, whether validation was weakened or gamed, whether relevant security problems are visible, and whether the implementation ignored an obvious existing solution or duplicated repository capability. Apply only the checks relevant to this task. Every finding must cite concrete observable evidence; do not report stylistic preferences as failures.
 
-Maintain your current narrative journal when evidence or judgment changes:
-${options.journal.journal}
-
-Before returning, write a self-contained verification result to:
-${options.journal.result}
+${artifactInstructions}
 
 Return "passed" when no material finding remains, "findings" with evidence-backed issues, "needs_input" only when user information is genuinely required, or "blocked" for an objective blocker. Return only the JSON required by the output schema.`;
 }

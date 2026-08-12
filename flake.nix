@@ -34,7 +34,10 @@
               runHook postCheck
             '';
 
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            nativeBuildInputs = [
+              pkgs.gitMinimal
+              pkgs.makeWrapper
+            ];
             installPhase = ''
               runHook preInstall
 
@@ -42,7 +45,8 @@
               install -d "$out/lib/agent-workflow" "$out/bin"
               cp -R dist node_modules package.json "$out/lib/agent-workflow/"
               makeWrapper ${pkgs.nodejs_24}/bin/node "$out/bin/agent-workflow-mcp" \
-                --add-flags "$out/lib/agent-workflow/dist/server.js"
+                --add-flags "$out/lib/agent-workflow/dist/server.js" \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gitMinimal ]}
 
               runHook postInstall
             '';
@@ -58,6 +62,10 @@
           default = agent-workflow;
         }
       );
+
+      checks = forAllSystems (system: {
+        agent-workflow = self.packages.${system}.agent-workflow;
+      });
 
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };

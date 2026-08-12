@@ -2,6 +2,7 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  readFileSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -28,9 +29,19 @@ interface CreateAgentJournalOptions {
   completionCriteria: string[];
 }
 
+interface JournalOutcome {
+  status: string;
+  summary: string;
+  questions: string[];
+  blocker: string | null;
+}
+
 function markdownList(items: string[]): string {
   return items.length === 0 ? "- None specified" : items.map((item) => `- ${item}`).join("\n");
 }
+
+const INITIAL_JOURNAL_STATUS =
+  "Current status: task created; execution has not started.";
 
 export function createAgentJournal(
   options: CreateAgentJournalOptions,
@@ -57,8 +68,8 @@ export function createAgentJournal(
 
   writeFileSync(
     paths.journal,
-    `# Journal\n\n` +
-      `Current status: task created; execution has not started.\n\n` +
+      `# Journal\n\n` +
+      `${INITIAL_JOURNAL_STATUS}\n\n` +
       `Last updated: ${new Date().toISOString()}\n`,
     { encoding: "utf8", flag: "wx" },
   );
@@ -66,10 +77,31 @@ export function createAgentJournal(
   return paths;
 }
 
+export function ensureStructuredJournal(
+  path: string,
+  outcome: JournalOutcome,
+): void {
+  const current = readFileSync(path, "utf8");
+  if (!current.includes(INITIAL_JOURNAL_STATUS)) {
+    return;
+  }
+
+  writeFileSync(
+    path,
+    `# Journal\n\n` +
+      `Current status: ${outcome.status}.\n\n` +
+      `## Summary\n\n${outcome.summary}\n\n` +
+      `## Questions\n\n${markdownList(outcome.questions)}\n\n` +
+      `## Blocker\n\n${outcome.blocker ?? "None"}\n\n` +
+      `Last updated: ${new Date().toISOString()}\n`,
+    "utf8",
+  );
+}
+
 export function ensureFrozenResult(
   path: string,
   role: AgentRole,
-  outcome: AgentOutcome,
+  outcome: JournalOutcome,
 ): void {
   if (!existsSync(path)) {
     const questions = markdownList(outcome.questions);

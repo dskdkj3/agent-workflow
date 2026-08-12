@@ -11,6 +11,12 @@ export const modelProfileSchema = z.enum([
 ]);
 export type ModelProfile = z.infer<typeof modelProfileSchema>;
 
+export const executionRouteSchema = z.enum([
+  "orchestrated",
+  "single_worker",
+]);
+export type ExecutionRoute = z.infer<typeof executionRouteSchema>;
+
 export interface ModelProfileDefinition {
   model: string;
   reasoningEffort: "high" | "max";
@@ -89,6 +95,17 @@ export const agentOutcomeSchema = z.object({
 });
 export type AgentOutcome = z.infer<typeof agentOutcomeSchema>;
 
+export const fastWorkerOutcomeSchema = agentOutcomeSchema.extend({
+  status: z.enum([
+    "completed",
+    "needs_input",
+    "blocked",
+    "failed",
+    "escalate",
+  ]),
+});
+export type FastWorkerOutcome = z.infer<typeof fastWorkerOutcomeSchema>;
+
 export const verificationFindingSchema = z.object({
   issue: z.string().min(1),
   evidence: z.string().min(1),
@@ -105,11 +122,28 @@ export const verificationOutcomeSchema = z.object({
 });
 export type VerificationOutcome = z.infer<typeof verificationOutcomeSchema>;
 
-export const workflowRunInputSchema = z.object({
-  request: z.string().trim().min(1).max(100_000),
-  workspace: z.string().trim().min(1).optional(),
-});
-export type WorkflowRunInput = z.infer<typeof workflowRunInputSchema>;
+export const workflowRunInputSchema = z
+  .object({
+    request: z.string().trim().min(1).max(100_000),
+    workspace: z.string().trim().min(1).optional(),
+    execution_route: executionRouteSchema.default("orchestrated"),
+    completion_criteria: z.array(z.string().trim().min(1)).default([]),
+  })
+  .superRefine((input, context) => {
+    if (
+      input.execution_route === "single_worker" &&
+      input.completion_criteria.length === 0
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["completion_criteria"],
+        message:
+          "single_worker requires at least one observable completion criterion",
+      });
+    }
+  });
+export type WorkflowRunInput = z.input<typeof workflowRunInputSchema>;
+export type ParsedWorkflowRunInput = z.output<typeof workflowRunInputSchema>;
 
 export const workflowRunOutputSchema = z.object({
   workflow_id: z.string().uuid(),
@@ -120,5 +154,7 @@ export const workflowRunOutputSchema = z.object({
   questions: z.array(z.string().min(1)),
   blocker: z.string().min(1).nullable(),
   usage: usageSchema,
+  execution_route: executionRouteSchema,
+  retry_route: z.literal("orchestrated").nullable(),
 });
 export type WorkflowRunOutput = z.infer<typeof workflowRunOutputSchema>;
