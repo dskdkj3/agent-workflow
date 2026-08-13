@@ -11,6 +11,7 @@ import {
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -344,6 +345,134 @@ test("CLI reports an empty fresh state directory without a SQLite error", (t) =>
   assert.equal(result.status, 1);
   assert.equal(result.stdout, "");
   assert.equal(result.stderr, "No workflows are stored\n");
+});
+
+test("loads a legacy Workflow Trace without migrating its read-only database", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "agent-workflow-legacy-trace-"));
+  const stateDir = join(root, "state");
+  const databasePath = join(stateDir, "controller.sqlite3");
+  const workflowId = "00000000-0000-4000-8000-000000000102";
+  const taskDir = join(stateDir, "tasks", workflowId);
+  const workerDir = join(taskDir, "workers", "worker-1");
+  mkdirSync(workerDir, { recursive: true });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const legacy = new DatabaseSync(databasePath);
+  legacy.exec(`
+    CREATE TABLE workflows (
+      id TEXT PRIMARY KEY,
+      request TEXT NOT NULL,
+      workspace TEXT NOT NULL,
+      task_dir TEXT NOT NULL,
+      execution_route TEXT NOT NULL DEFAULT 'orchestrated',
+      completion_criteria_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL,
+      summary TEXT,
+      result_path TEXT,
+      questions_json TEXT NOT NULL DEFAULT '[]',
+      blocker TEXT,
+      usage_json TEXT NOT NULL,
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE agent_runs (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      parent_run_id TEXT REFERENCES agent_runs(id),
+      role TEXT NOT NULL,
+      profile TEXT NOT NULL,
+      task_dir TEXT NOT NULL,
+      thread_id TEXT,
+      status TEXT NOT NULL,
+      usage_json TEXT,
+      error TEXT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE TABLE events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      run_id TEXT REFERENCES agent_runs(id),
+      type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE checkpoints (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      run_id TEXT REFERENCES agent_runs(id),
+      kind TEXT NOT NULL,
+      commit_id TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+  `);
+  legacy.prepare(`
+    INSERT INTO workflows (
+      id, request, workspace, task_dir, execution_route,
+      completion_criteria_json, status, summary, questions_json,
+      usage_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'orchestrated', '[]', 'completed', ?, '[]', ?, ?, ?)
+  `).run(
+    workflowId,
+    "Read a legacy trace",
+    join(root, "workspace"),
+    taskDir,
+    "Legacy workflow completed",
+    JSON.stringify(workerUsage),
+    "2026-08-01T00:00:00.000Z",
+    "2026-08-01T00:01:00.000Z",
+  );
+  legacy.prepare(`
+    INSERT INTO agent_runs (
+      id, workflow_id, parent_run_id, role, profile, task_dir,
+      thread_id, status, usage_json, error, started_at, completed_at
+    ) VALUES (?, ?, NULL, 'worker', 'luna_max', ?, NULL, 'completed', ?, NULL, ?, ?)
+  `).run(
+    "legacy-worker",
+    workflowId,
+    workerDir,
+    JSON.stringify(workerUsage),
+    "2026-08-01T00:00:00.000Z",
+    "2026-08-01T00:01:00.000Z",
+  );
+  legacy.close();
+
+  const columns = (table: string): string[] => {
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      return (
+        database.prepare(`PRAGMA table_info(${table})`).all() as {
+          name: string;
+        }[]
+      ).map((column) => column.name);
+    } finally {
+      database.close();
+    }
+  };
+  const workflowColumnsBefore = columns("workflows");
+  const agentRunColumnsBefore = columns("agent_runs");
+  const databaseBefore = readFileSync(databasePath);
+
+  const trace = loadWorkflowTrace(stateDir, workflowId);
+
+  assert.equal(trace.workflow.id, workflowId);
+  assert.equal(trace.workflow.usage.status, "unknown");
+  assert.equal(trace.workflow.usage.source, null);
+  assert.equal(trace.workflow.failure_kind, null);
+  assert.equal(trace.workflow.recovery_requires_user_approval, false);
+  assert.equal(trace.agents[0]?.profile, "luna_max");
+  assert.equal(trace.agents[0]?.model, "gpt-5.6-luna");
+  assert.equal(trace.agents[0]?.reasoning_effort, "max");
+  assert.equal(trace.agents[0]?.fast.requested_service_tier, "default");
+  assert.equal(trace.agents[0]?.fast.effective_service_tier, null);
+  assert.equal(trace.agents[0]?.usage.status, "unknown");
+  assert.equal(trace.agents[0]?.usage.source, null);
+  assert.equal(trace.agents[0]?.error_kind, null);
+  assert.deepEqual(columns("workflows"), workflowColumnsBefore);
+  assert.deepEqual(columns("agent_runs"), agentRunColumnsBefore);
+  assert.deepEqual(readFileSync(databasePath), databaseBefore);
 });
 
 test("read-only Web viewer stays on loopback and does not follow artifact symlinks", async (t) => {

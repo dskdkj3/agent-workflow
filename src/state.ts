@@ -127,62 +127,82 @@ function parseUsage(raw: unknown): AgentUsage {
   return usageSchema.parse(parseJson(raw, emptyUsage()));
 }
 
+function nullableString(raw: unknown): string | null {
+  return raw === null || raw === undefined ? null : String(raw);
+}
+
+function parseUsageStatus(raw: unknown): UsageStatus {
+  return raw === null || raw === undefined
+    ? "unknown"
+    : usageStatusSchema.parse(raw);
+}
+
 function rowToWorkflow(row: Record<string, unknown>): StoredWorkflow {
   return {
     id: String(row.id),
     request: String(row.request),
     workspace: String(row.workspace),
     taskDir: String(row.task_dir),
-    executionRoute: executionRouteSchema.parse(row.execution_route),
+    executionRoute: executionRouteSchema.parse(
+      row.execution_route ?? "orchestrated",
+    ),
     completionCriteria: parseJson(row.completion_criteria_json, []),
     status: String(row.status),
-    summary: row.summary === null ? null : String(row.summary),
-    resultPath: row.result_path === null ? null : String(row.result_path),
+    summary: nullableString(row.summary),
+    resultPath: nullableString(row.result_path),
     questions: parseJson(row.questions_json, []),
-    blocker: row.blocker === null ? null : String(row.blocker),
+    blocker: nullableString(row.blocker),
     usage: parseUsage(row.usage_json),
-    usageStatus: usageStatusSchema.parse(row.usage_status),
-    failureKind:
-      row.failure_kind === null ? null : String(row.failure_kind),
+    usageStatus: parseUsageStatus(row.usage_status),
+    failureKind: nullableString(row.failure_kind),
     recoveryRequiresUserApproval:
       Number(row.recovery_requires_user_approval) === 1,
-    leaseOwner: row.lease_owner === null ? null : String(row.lease_owner),
-    leaseEpoch: Number(row.lease_epoch),
-    leaseClaimedAt:
-      row.lease_claimed_at === null ? null : String(row.lease_claimed_at),
-    leaseExpiresAt:
-      row.lease_expires_at === null ? null : String(row.lease_expires_at),
+    leaseOwner: nullableString(row.lease_owner),
+    leaseEpoch:
+      row.lease_epoch === null || row.lease_epoch === undefined
+        ? 0
+        : Number(row.lease_epoch),
+    leaseClaimedAt: nullableString(row.lease_claimed_at),
+    leaseExpiresAt: nullableString(row.lease_expires_at),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
 }
 
 function rowToAgentRun(row: Record<string, unknown>): StoredAgentRun {
+  const profile = modelProfileSchema.parse(row.profile ?? "sol_high");
+  const profileDefinition = modelProfiles[profile];
   return {
     id: String(row.id),
     workflowId: String(row.workflow_id),
-    parentRunId:
-      row.parent_run_id === null ? null : String(row.parent_run_id),
+    parentRunId: nullableString(row.parent_run_id),
     role: roleSchema.parse(row.role),
-    profile: modelProfileSchema.parse(row.profile),
-    model: String(row.model),
+    profile,
+    model:
+      row.model === null || row.model === undefined
+        ? profileDefinition.model
+        : String(row.model),
     reasoningEffort:
-      row.reasoning_effort === "max" ? "max" : "high",
-    requestedServiceTier: String(row.requested_service_tier),
-    effectiveServiceTier:
-      row.effective_service_tier === null
-        ? null
-        : String(row.effective_service_tier),
+      row.reasoning_effort === null || row.reasoning_effort === undefined
+        ? profileDefinition.reasoningEffort
+        : row.reasoning_effort === "max"
+          ? "max"
+          : "high",
+    requestedServiceTier:
+      row.requested_service_tier === null ||
+      row.requested_service_tier === undefined
+        ? "default"
+        : String(row.requested_service_tier),
+    effectiveServiceTier: nullableString(row.effective_service_tier),
     taskDir: String(row.task_dir),
-    threadId: row.thread_id === null ? null : String(row.thread_id),
+    threadId: nullableString(row.thread_id),
     status: String(row.status) as AgentRunStatus,
     usage: parseUsage(row.usage_json),
-    usageStatus: usageStatusSchema.parse(row.usage_status),
-    error: row.error === null ? null : String(row.error),
-    errorKind: row.error_kind === null ? null : String(row.error_kind),
+    usageStatus: parseUsageStatus(row.usage_status),
+    error: nullableString(row.error),
+    errorKind: nullableString(row.error_kind),
     startedAt: String(row.started_at),
-    completedAt:
-      row.completed_at === null ? null : String(row.completed_at),
+    completedAt: nullableString(row.completed_at),
   };
 }
 
