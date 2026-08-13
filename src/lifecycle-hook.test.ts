@@ -58,13 +58,18 @@ function fixture(): {
     ["Durable content is recoverable"],
     emptyUsage(),
   );
-  store.createAgentRun({
+  const lease = store.claimWorkflow(workflowId, "hook-owner", 60_000);
+  assert.ok(lease);
+  store.createAgentRun(lease, {
     id: runId,
     workflowId,
     parentRunId: null,
     role: "worker",
     profile: "luna_max",
     taskDir: agentDir,
+    model: "gpt-5.6-luna",
+    reasoningEffort: "max",
+    requestedServiceTier: "default",
   });
   store.close();
   return {
@@ -82,6 +87,9 @@ function fixture(): {
       state_database: databasePath,
       checkpoint_work_tree: workTree,
       checkpoint_git_dir: join(root, "checkpoint.git"),
+      lease_owner: lease.owner,
+      lease_epoch: lease.epoch,
+      lease_claimed_at: lease.claimedAt,
     },
   };
 }

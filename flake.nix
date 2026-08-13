@@ -24,7 +24,7 @@
             version = "0.1.0";
             src = self;
 
-            npmDepsHash = "sha256-CSaGBxO/qztAtcWFJCHCIA7bouMmksu8NKAXBV/OEzM=";
+            npmDepsHash = "sha256-wVfjqKSR63krW+TX21S49gGQkBWaLvRLTtOytw+fy54=";
             npmBuildScript = "build";
 
             doCheck = true;
@@ -44,6 +44,9 @@
               npm prune --omit=dev
               install -d "$out/lib/agent-workflow" "$out/bin"
               cp -R dist node_modules package.json "$out/lib/agent-workflow/"
+              makeWrapper ${pkgs.nodejs_24}/bin/node "$out/bin/agent-workflow" \
+                --add-flags "$out/lib/agent-workflow/dist/cli.js" \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.xdg-utils ]}
               makeWrapper ${pkgs.nodejs_24}/bin/node "$out/bin/agent-workflow-mcp" \
                 --add-flags "$out/lib/agent-workflow/dist/server.js" \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gitMinimal ]}
@@ -54,7 +57,7 @@
             meta = {
               description = "Minimal Codex Orchestrator, Worker, and Verifier MCP workflow";
               homepage = "https://github.com/dskdkj3/agent-workflow";
-              mainProgram = "agent-workflow-mcp";
+              mainProgram = "agent-workflow";
               platforms = systems;
             };
           };

@@ -21,8 +21,16 @@ export interface AgentTurnRequest<T> {
   workspace: string;
   taskDir: string;
   prompt: string;
+  /** Root-object schema sent to the upstream Structured Outputs API. */
+  outputSchema: z.ZodType<unknown>;
+  /** Authoritative semantic validator applied after decoding the response. */
   schema: z.ZodType<T>;
   codexHome?: string;
+  executionLease?: {
+    owner: string;
+    epoch: number;
+    claimedAt: string;
+  };
   onThreadStarted?: (threadId: string) => void | Promise<void>;
   signal?: AbortSignal;
 }
@@ -36,11 +44,20 @@ export interface AgentTurnResult<T> {
   output: T;
   /** Latest cumulative usage snapshot for this Codex thread. */
   usage: AgentUsage | null;
+  /** Actual upstream service tier when the adapter can observe it. */
+  effectiveServiceTier?: string | null;
+}
+
+export interface AgentRunConfiguration {
+  model: string;
+  reasoningEffort: "high" | "max";
+  requestedServiceTier: string;
 }
 
 export interface AgentRunner {
   start<T>(request: AgentTurnRequest<T>): Promise<AgentTurnResult<T>>;
   continue<T>(request: ContinueAgentTurnRequest<T>): Promise<AgentTurnResult<T>>;
+  configuration?(profile: ModelProfile): AgentRunConfiguration;
 }
 
 export interface CodexAgentRunnerOptions {
@@ -146,20 +163,38 @@ export class CodexAgentRunner implements AgentRunner {
     this.baseConfig = buildCodexBaseConfig(options);
   }
 
+  configuration(profileName: ModelProfile): AgentRunConfiguration {
+    const profile = modelProfiles[profileName];
+    const configuredTier = (this.baseConfig as Record<string, unknown>)[
+      "service_tier"
+    ];
+    return {
+      model: profile.model,
+      reasoningEffort: profile.reasoningEffort,
+      requestedServiceTier:
+        typeof configuredTier === "string" && configuredTier.trim() !== ""
+          ? configuredTier
+          : "default",
+    };
+  }
+
   async start<T>(request: AgentTurnRequest<T>): Promise<AgentTurnResult<T>> {
-    const thread = this.codex(request.profile, request.codexHome).startThread(
-      this.threadOptions(request),
-    );
+    const thread = this.codex(
+      request.profile,
+      request.codexHome,
+      request.executionLease,
+    ).startThread(this.threadOptions(request));
     return this.run(thread, request);
   }
 
   async continue<T>(
     request: ContinueAgentTurnRequest<T>,
   ): Promise<AgentTurnResult<T>> {
-    const thread = this.codex(request.profile, request.codexHome).resumeThread(
-      request.threadId,
-      this.threadOptions(request),
-    );
+    const thread = this.codex(
+      request.profile,
+      request.codexHome,
+      request.executionLease,
+    ).resumeThread(request.threadId, this.threadOptions(request));
     return this.run(thread, request);
   }
 
@@ -177,8 +212,15 @@ export class CodexAgentRunner implements AgentRunner {
     };
   }
 
-  private codex(profileName: ModelProfile, codexHome?: string): Codex {
-    const key = `${profileName}\u0000${codexHome ?? ""}`;
+  private codex(
+    profileName: ModelProfile,
+    codexHome?: string,
+    executionLease?: AgentTurnRequest<unknown>["executionLease"],
+  ): Codex {
+    const leaseKey = executionLease === undefined
+      ? ""
+      : `${executionLease.owner}:${executionLease.epoch}:${executionLease.claimedAt}`;
+    const key = `${profileName}\u0000${codexHome ?? ""}\u0000${leaseKey}`;
     const existing = this.codexByProfile.get(key);
     if (existing) {
       return existing;
@@ -189,10 +231,21 @@ export class CodexAgentRunner implements AgentRunner {
       ...(this.options.codexPath
         ? { codexPathOverride: this.options.codexPath }
         : {}),
-      ...(codexHome
+      ...(codexHome || executionLease
         ? {
             env: Object.fromEntries(
-              Object.entries({ ...process.env, CODEX_HOME: codexHome }).filter(
+              Object.entries({
+                ...process.env,
+                ...(codexHome ? { CODEX_HOME: codexHome } : {}),
+                ...(executionLease
+                  ? {
+                      AGENT_WORKFLOW_LEASE_OWNER: executionLease.owner,
+                      AGENT_WORKFLOW_LEASE_EPOCH: String(executionLease.epoch),
+                      AGENT_WORKFLOW_LEASE_CLAIMED_AT:
+                        executionLease.claimedAt,
+                    }
+                  : {}),
+              }).filter(
                 (entry): entry is [string, string] => entry[1] !== undefined,
               ),
             ),
@@ -216,7 +269,7 @@ export class CodexAgentRunner implements AgentRunner {
     request: AgentTurnRequest<T>,
   ): Promise<AgentTurnResult<T>> {
     const streamed = await thread.runStreamed(request.prompt, {
-      outputSchema: z.toJSONSchema(request.schema),
+      outputSchema: z.toJSONSchema(request.outputSchema),
       ...(request.signal ? { signal: request.signal } : {}),
     });
     let threadId = thread.id;

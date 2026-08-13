@@ -1,8 +1,8 @@
 # Agent Workflow
 
-Standalone Workflow MCP controller for a minimal Codex-based agent workflow.
+Standalone Workflow MCP controller and trace viewer for a minimal Codex-based agent workflow.
 
-The current MVP intentionally exposes one synchronous tool with two routes:
+The current MVP exposes one synchronous execution tool with two routes, plus a narrow recorder for explicit recovery decisions:
 
 ```text
 Interaction Agent
@@ -17,12 +17,15 @@ Interaction Agent
 - MCP SDK `2.0.0`, modern protocol revision `2026-07-28`, with stdio compatibility for Codex clients using the `2025-06-18` initialize handshake
 - Codex SDK `0.147.0`
 - stdio transport only
+- MCP tools: `workflow.run` and `workflow.recovery_decision`
 - one Worker and one independent Verifier per completed workflow run
 - allowlisted model routes: `luna_max`, `terra_high`, `sol_high`, `sol_max`
 - Orchestrator uses `sol_high`; it chooses Worker and Verifier routes from the residual cognitive burden
 - the explicit `single_worker` route uses `luna_max` for both the bounded Worker and mechanical independent Verifier
 - semantic Journal checkpoints are committed by the Controller to one local, non-project Git repository per workflow
 - an interrupted Controller invocation can resume the original Workflow Run by reusing its caller-generated `workflow_id`
+- monotonic lease epochs fence superseded Controllers, late Agent turns, and stale lifecycle hooks
+- one authoritative Workflow Trace powers text, JSON, follow, and loopback-only Web views
 - no MCP Tasks, MRTR, scheduler, general retry engine, or persistent routing learner
 - standalone Nix package for the internal `agent-workflow-mcp` server; host integration remains external
 
@@ -54,12 +57,20 @@ criterion. If the Worker requests escalation or the independent Verifier rejects
 result, `retry_route` is set to `orchestrated` so the Interaction Agent can retry
 without asking the user to coordinate the correction.
 
+If an upstream turn is classified as `cyber_policy`, the Workflow stops with
+`recovery_requires_user_approval=true` and `retry_route=null`. The Interaction
+Agent must ask whether the user approves a semantically different recovery. It
+then records the approval or denial on the failed Workflow with
+`workflow.recovery_decision`; this recorder does not retry or mutate the failed
+run. An approved recovery starts as a new Workflow Run with a new ID.
+
 It returns a structured terminal outcome and paths to the persisted task artifacts.
 The `usage` object sums the latest cumulative SDK usage snapshot for each Agent
-thread. A resumed Orchestrator's latest snapshot replaces its earlier planning
-snapshot. Repeated tool rounds therefore increase `input_tokens` even when much of
-the context is cached; this measures cumulative model processing, not unique context
-size.
+thread. `usage_status` distinguishes `measured`, `estimated`, `partial`, and
+`unknown`; missing usage is never presented as an exact zero. A resumed
+Orchestrator's latest snapshot replaces its earlier planning snapshot. Repeated
+tool rounds therefore increase `input_tokens` even when much of the context is
+cached; this measures cumulative model processing, not unique context size.
 
 `needs_input` is terminal for the current synchronous invocation. The Interaction
 Agent should discuss the questions with the user, then start a new `workflow.run`
@@ -69,6 +80,31 @@ Because one call can contain a complete coding task, MCP clients must configure 
 tool timeout longer than their normal short-tool default (for example,
 `tool_timeout_sec = 3600`).
 
+## Workflow Trace
+
+All trace views consume the same read-only projection:
+
+```bash
+agent-workflow trace latest
+agent-workflow trace <workflow-id>
+agent-workflow trace --follow <workflow-id>
+agent-workflow trace --json <workflow-id>
+agent-workflow trace --web <workflow-id>
+```
+
+The Trace includes route, status, timing, Agent parent/child relationships, role,
+model, reasoning effort, requested and effective service tier, Codex thread ID,
+usage provenance, checkpoints, failures, recovery decisions, and artifact paths.
+The Web viewer listens only on `127.0.0.1`, is read-only, and polls the same Trace
+projection used by the CLI.
+
+The current Codex SDK does not reliably expose the service tier actually applied
+by the upstream gateway, and this implementation has no authoritative
+quota-equivalent accounting feed. Trace therefore shows effective Fast state and
+equivalent credits as `unknown` unless an `AgentRunner` adapter supplies measured
+data. Requested service tier is shown separately and is never treated as proof of
+the effective tier.
+
 ## Development
 
 ```bash
@@ -77,10 +113,11 @@ npm run check
 npm start
 ```
 
-The flake default package installs the internal stdio server:
+The flake default package installs the trace command and the internal stdio server:
 
 ```bash
 nix build
+./result/bin/agent-workflow trace latest
 ./result/bin/agent-workflow-mcp
 ```
 
@@ -111,7 +148,18 @@ and Journal without treating a newly written unfinished result as final. The com
 startup user-level and project-level `AGENTS.md` instruction chain across compaction,
 so the hook does not duplicate those instructions.
 
-`npm run check` uses a fake `AgentRunner` for workflow execution and real stdio
+Each Controller execution generation has a monotonic lease epoch. Checkpoint
+commits and lifecycle hook metadata carry that epoch, and child Codex processes
+carry the matching immutable lease identity. A stale generation cannot register
+authoritative events, checkpoints, or a Terminal Outcome after a takeover.
+If a heartbeat runs after its nominal expiry but no takeover has changed the
+owner or epoch, the same generation may renew its lease; once another Controller
+increments the epoch, the old generation remains fenced permanently.
+Structured outcomes are persisted before the Controller rematerializes final
+result files, so interrupted or stale `result.md` content is not trusted as the
+completion decision.
+
+`npm run check` uses fake `AgentRunner` implementations for workflow execution and real stdio
 subprocesses for the MCP `2025-06-18` and `2026-07-28` handshakes. It does not
 spend model quota.
 
@@ -125,6 +173,11 @@ or edits may already have taken effect and must not be replayed blindly. Detaile
 Worker and Verifier evidence stays in workspace and task artifacts; the final
 Orchestrator prompt receives compact structured outcomes and artifact paths instead
 of Agent conversation history.
+
+The Workflow Trace promotes only evidence references present in structured
+Verification outcomes. Free-form evidence mentioned only inside a Journal remains
+available as an Artifact for on-demand inspection; it is not turned into an
+authoritative Trace claim by heuristic text parsing.
 
 The SDK `0.147.0` TypeScript `ThreadOptions` union does not yet include the real
 `max` effort. This project passes `model_reasoning_effort="max"` through the generic

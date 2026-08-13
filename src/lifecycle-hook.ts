@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CheckpointRepository } from "./checkpoints.js";
-import { StateStore } from "./state.js";
+import { StateStore, type WorkflowLease } from "./state.js";
 
 export interface LifecycleHookMetadata {
   workflow_id: string;
@@ -15,6 +15,9 @@ export interface LifecycleHookMetadata {
   state_database: string;
   checkpoint_work_tree: string;
   checkpoint_git_dir: string;
+  lease_owner: string;
+  lease_epoch: number;
+  lease_claimed_at: string;
   git_path?: string;
 }
 
@@ -35,6 +38,12 @@ interface HookInput {
   trigger?: string;
 }
 
+export interface LifecycleHookLeaseIdentity {
+  owner: string;
+  epoch: number;
+  claimedAt: string;
+}
+
 function readStdin(): string {
   return readFileSync(0, "utf8");
 }
@@ -43,7 +52,50 @@ function readMetadata(path: string): LifecycleHookMetadata {
   return JSON.parse(readFileSync(resolve(path), "utf8")) as LifecycleHookMetadata;
 }
 
+function readLeaseIdentityFromEnvironment(): LifecycleHookLeaseIdentity {
+  const owner = process.env.AGENT_WORKFLOW_LEASE_OWNER;
+  const epoch = Number(process.env.AGENT_WORKFLOW_LEASE_EPOCH);
+  const claimedAt = process.env.AGENT_WORKFLOW_LEASE_CLAIMED_AT;
+  if (
+    owner === undefined ||
+    owner === "" ||
+    !Number.isSafeInteger(epoch) ||
+    epoch < 1 ||
+    claimedAt === undefined ||
+    claimedAt === ""
+  ) {
+    throw new Error("Lifecycle hook execution lease identity is missing");
+  }
+  return { owner, epoch, claimedAt };
+}
+
+function assertMetadataIdentity(
+  metadata: LifecycleHookMetadata,
+  identity: LifecycleHookLeaseIdentity,
+): void {
+  if (
+    metadata.lease_owner !== identity.owner ||
+    metadata.lease_epoch !== identity.epoch ||
+    metadata.lease_claimed_at !== identity.claimedAt
+  ) {
+    throw new Error("Lifecycle hook metadata belongs to another lease epoch");
+  }
+}
+
 function checkpoint(metadata: LifecycleHookMetadata): void {
+  const lease: WorkflowLease = {
+    workflowId: metadata.workflow_id,
+    owner: metadata.lease_owner,
+    epoch: metadata.lease_epoch,
+    claimedAt: metadata.lease_claimed_at,
+  };
+  const store = new StateStore(metadata.state_database);
+  try {
+    store.assertWorkflowLease(lease);
+  } catch (error) {
+    store.close();
+    throw error;
+  }
   const repository = new CheckpointRepository({
     workTree: metadata.checkpoint_work_tree,
     gitDir: metadata.checkpoint_git_dir,
@@ -51,22 +103,15 @@ function checkpoint(metadata: LifecycleHookMetadata): void {
   });
   const checkpointCommit = repository.commit("journal.pre_compact", {
     includeNewResults: false,
+    leaseEpoch: lease.epoch,
   });
-  const store = new StateStore(metadata.state_database);
   try {
     store.recordCheckpoint(
-      metadata.workflow_id,
+      lease,
       metadata.run_id,
       checkpointCommit.kind,
       checkpointCommit.id,
-    );
-    store.appendEvent(
-      metadata.workflow_id,
-      metadata.run_id,
       "journal.pre_compact",
-      {
-        commit_id: checkpointCommit.id,
-      },
     );
   } finally {
     store.close();
@@ -89,7 +134,13 @@ function compactContext(metadata: LifecycleHookMetadata): string {
 export function handleLifecycleHook(
   metadata: LifecycleHookMetadata,
   input: HookInput,
+  identity: LifecycleHookLeaseIdentity = {
+    owner: metadata.lease_owner,
+    epoch: metadata.lease_epoch,
+    claimedAt: metadata.lease_claimed_at,
+  },
 ): Record<string, unknown> {
+  assertMetadataIdentity(metadata, identity);
   if (input.hook_event_name === "PreCompact") {
     checkpoint(metadata);
     return { continue: true, suppressOutput: true };
@@ -115,7 +166,11 @@ function main(): void {
       throw new Error("Lifecycle hook metadata path is required");
     }
     input = JSON.parse(readStdin()) as HookInput;
-    const output = handleLifecycleHook(readMetadata(metadataPath), input);
+    const output = handleLifecycleHook(
+      readMetadata(metadataPath),
+      input,
+      readLeaseIdentityFromEnvironment(),
+    );
     process.stdout.write(`${JSON.stringify(output)}\n`);
   } catch (error) {
     const message = `Agent Workflow lifecycle hook failed: ${String(error)}`;

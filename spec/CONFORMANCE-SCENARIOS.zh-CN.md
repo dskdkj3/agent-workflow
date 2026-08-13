@@ -64,6 +64,58 @@
 
 失败：同一个 Workflow Run 同时被表示为完成和失败，或者先产生最终结果后又静默改成另一个最终结果。
 
+## 考题七：接管后旧执行不能继续推进
+
+准备：让执行 A 停在一个尚未返回的 Agent turn，并使其推进权过期；由执行 B 接管同一个 Workflow Run。
+
+做法：让 B 完成 Workflow，再让 A 的旧结果晚到。
+
+通过：A 不能写入阶段完成、Checkpoint 或第二个 Terminal Outcome，也不能继续启动后续执行单元。
+
+失败：旧结果覆盖新结果、重复完成阶段，或产生两个 Verifier / Terminal Outcome。
+
+补充：如果执行 A 的心跳只是短暂晚于名义过期时间、且尚无 B 接管，实现可以允许 A 续租；一旦 B 已通过递增 generation / epoch 接管，A 不能再通过迟到心跳恢复推进权。
+
+## 考题八：Verification 的反对意见不能被内部叙述推翻
+
+准备：让执行者报告完成，让独立 Verification 返回有证据的 material findings。
+
+做法：观察实现是否仍调用一个内部角色把 findings 改写成 `completed`。
+
+通过：Workflow 必须修正、升级或返回非 `completed`；已知 findings 不能由无新证据的内部判断推翻。
+
+失败：仅凭执行者或协调者的叙述产生 `completed`。
+
+## 考题九：资源缺口必须显式表示
+
+准备：让一个执行单元有可测 usage，另一个失败且没有 usage；同时让实际 Fast 和等价额度不可观测。
+
+做法：读取 Workflow Trace。
+
+通过：总 usage 标为 `partial`，实际 Fast 和等价额度标为 `unknown`。
+
+失败：缺失 usage 被算作精确零，或请求 Fast 被冒充为实际 Fast。
+
+## 考题十：安全分类后的恢复需要用户批准
+
+准备：让上游返回要求语义不同恢复的安全分类失败。
+
+做法：观察交互式实现收到失败后的行为。
+
+通过：原 Workflow 保存失败和证据，不公布自动 retry route；实现等待用户明确批准或拒绝，并把决定写回原 Workflow Trace。
+
+失败：实现自动改写、拆分、换路线、启动新 Workflow，或由交互层直接接管执行。
+
+## 考题十一：所有 Trace 视图必须一致
+
+准备：创建包含多个内部执行单元、Checkpoint、失败、恢复决定和 Artifact 的 Workflow Run。
+
+做法：分别读取文本、机器可读和图形 Trace 视图。
+
+通过：它们来自同一读模型，对路线、父子关系、状态、时间、模型、资源可信度和 Artifact 的结论一致。
+
+失败：某个视图自行解析日志，导致状态、Fast、usage 或历史与其它视图不同。
+
 ## 后续如何变成自动测试
 
 将来每个实现只需要提供一个很薄的测试适配层，让测试程序能够：
@@ -73,5 +125,6 @@
 - 暂停 Verification；
 - 模拟中断、恢复和竞争信号；
 - 检查测试 Workspace 是否被修改。
+- 读取 Workflow Trace，并模拟执行权接管和 Recovery Decision。
 
 测试适配层只用于操作考题，不规定真实用户必须通过什么 API 使用 Workflow。

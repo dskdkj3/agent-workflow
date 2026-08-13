@@ -39,6 +39,7 @@ interface FakeStep {
   error?: Error;
   startedBeforeError?: boolean;
   journal?: string;
+  result?: string;
 }
 
 type RunnerCall =
@@ -105,6 +106,9 @@ class FakeAgentRunner implements AgentRunner {
       assert.ok(step.threadId, `Interrupted ${expectedKind} step needs a thread ID`);
       request.onThreadStarted?.(step.threadId);
     }
+    if (step.result !== undefined) {
+      writeFileSync(join(request.taskDir, "result.md"), step.result, "utf8");
+    }
     if (step.error) {
       throw step.error;
     }
@@ -117,6 +121,72 @@ class FakeAgentRunner implements AgentRunner {
       output: request.schema.parse(step.output),
       usage: step.usage ?? null,
     };
+  }
+}
+
+class DeferredPlanningRunner implements AgentRunner {
+  readonly calls: AgentTurnRequest<unknown>[] = [];
+  readonly started: Promise<void>;
+  private resolveStarted!: () => void;
+  private resolveTurn!: (result: AgentTurnResult<unknown>) => void;
+  private readonly turn: Promise<AgentTurnResult<unknown>>;
+
+  constructor() {
+    this.started = new Promise((resolvePromise) => {
+      this.resolveStarted = resolvePromise;
+    });
+    this.turn = new Promise((resolvePromise) => {
+      this.resolveTurn = resolvePromise;
+    });
+  }
+
+  async start<T>(request: AgentTurnRequest<T>): Promise<AgentTurnResult<T>> {
+    this.calls.push(request as AgentTurnRequest<unknown>);
+    await request.onThreadStarted?.("takeover-orchestrator");
+    this.resolveStarted();
+    return this.turn as Promise<AgentTurnResult<T>>;
+  }
+
+  async continue<T>(
+    _request: ContinueAgentTurnRequest<T>,
+  ): Promise<AgentTurnResult<T>> {
+    throw new Error("The stale Controller must not continue another turn");
+  }
+
+  complete(output: unknown, usage: AgentUsage | null): void {
+    this.resolveTurn({
+      threadId: "takeover-orchestrator",
+      output,
+      usage,
+    });
+  }
+}
+
+class AbortableRunner implements AgentRunner {
+  readonly started: Promise<void>;
+  private resolveStarted!: () => void;
+
+  constructor() {
+    this.started = new Promise((resolvePromise) => {
+      this.resolveStarted = resolvePromise;
+    });
+  }
+
+  async start<T>(request: AgentTurnRequest<T>): Promise<AgentTurnResult<T>> {
+    this.resolveStarted();
+    return new Promise((_resolvePromise, rejectPromise) => {
+      request.signal?.addEventListener(
+        "abort",
+        () => rejectPromise(new Error("runner observed cancellation")),
+        { once: true },
+      );
+    });
+  }
+
+  async continue<T>(
+    _request: ContinueAgentTurnRequest<T>,
+  ): Promise<AgentTurnResult<T>> {
+    throw new Error("Unexpected continue after cancellation");
   }
 }
 
@@ -241,7 +311,7 @@ async function expectInterruptedRun(
   const controller = new WorkflowController({
     stateDir: fixture.stateDir,
     runner: new FakeAgentRunner(steps),
-    leaseMs: 20,
+    leaseMs: 60_000,
   });
   try {
     await assert.rejects(
@@ -254,10 +324,12 @@ async function expectInterruptedRun(
       WorkflowInterruptedError,
     );
     assert.equal(controller.store.getStoredWorkflow(workflowId)?.status, "running");
+    controller.store.database
+      .prepare("UPDATE workflows SET lease_expires_at = ? WHERE id = ?")
+      .run("1970-01-01T00:00:00.000Z", workflowId);
   } finally {
     controller.close();
   }
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
 }
 
 test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists the result", async (t) => {
@@ -412,6 +484,9 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
   assert.ok(verifierRun);
   assert.equal(orchestratorRun.status, "completed");
   assert.equal(orchestratorRun.profile, "sol_high");
+  assert.equal(orchestratorRun.model, "gpt-5.6-sol");
+  assert.equal(orchestratorRun.reasoning_effort, "high");
+  assert.equal(orchestratorRun.requested_service_tier, "default");
   assert.equal(orchestratorRun.thread_id, "orchestrator-thread");
   assert.deepEqual(
     JSON.parse(String(orchestratorRun.usage_json)),
@@ -489,10 +564,16 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
       ),
     [
       "workflow.started",
+      "agent.dispatched",
       "orchestrator.planned",
+      "agent.dispatched",
       "worker.completed",
+      "agent.completed",
+      "agent.dispatched",
       "verifier.completed",
+      "agent.completed",
       "orchestrator.completed",
+      "agent.completed",
       "workflow.terminal",
     ],
   );
@@ -711,7 +792,7 @@ test("escalates a fast-path result rejected by independent verification", async 
   );
 });
 
-test("lets the Orchestrator reject a result after independent findings", async (t) => {
+test("independent findings reject the result without a final Orchestrator turn", async (t) => {
   const fixture = createFixture();
   const runner = new FakeAgentRunner([
     {
@@ -787,14 +868,16 @@ test("lets the Orchestrator reject a result after independent findings", async (
   });
 
   assert.equal(output.status, "failed");
-  assert.match(output.summary, /Independent evidence/);
+  assert.equal(output.summary, "The requested behavior is not implemented");
+  assert.equal(output.failure_kind, "verification_rejected");
+  assert.equal(runner.calls.length, 3);
   assert.match(
     readFileSync(join(output.task_dir, "verifier", "result.md"), "utf8"),
     /workspace listing contains no expected\.txt/,
   );
   assert.deepEqual(
     output.usage,
-    sumUsage(orchestratorCumulativeUsage, workerUsage, verifierUsage),
+    sumUsage(planUsage, workerUsage, verifierUsage),
   );
 });
 
@@ -890,6 +973,8 @@ test("converts a runner failure into a failed workflow", async (t) => {
   assert.equal(output.summary, "simulated runner failure");
   assert.equal(output.blocker, "simulated runner failure");
   assert.deepEqual(output.usage, planUsage);
+  assert.equal(output.usage_status, "partial");
+  assert.equal(output.failure_kind, "execution_error");
   assert.equal(mode(String(output.result_path)), 0o444);
   assert.match(
     readFileSync(String(output.result_path), "utf8"),
@@ -919,7 +1004,11 @@ test("converts a runner failure into a failed workflow", async (t) => {
       ),
     [
       "workflow.started",
+      "agent.dispatched",
       "orchestrator.planned",
+      "agent.dispatched",
+      "agent.failed",
+      "agent.failed",
       "workflow.execution_failed",
       "workflow.terminal",
     ],
@@ -969,7 +1058,7 @@ test("resumes an interrupted Orchestrator planning turn", async (t) => {
   const controller = new WorkflowController({
     stateDir: fixture.stateDir,
     runner,
-    leaseMs: 20,
+    leaseMs: 60_000,
   });
   t.after(() => controller.close());
 
@@ -1030,7 +1119,7 @@ test("resumes an interrupted Worker turn without rerunning the Orchestrator plan
   const controller = new WorkflowController({
     stateDir: fixture.stateDir,
     runner,
-    leaseMs: 20,
+    leaseMs: 60_000,
   });
   t.after(() => controller.close());
 
@@ -1094,7 +1183,7 @@ test("resumes an interrupted Verifier turn", async (t) => {
   const controller = new WorkflowController({
     stateDir: fixture.stateDir,
     runner,
-    leaseMs: 20,
+    leaseMs: 60_000,
   });
   t.after(() => controller.close());
 
@@ -1156,7 +1245,7 @@ test("resumes an interrupted final Orchestrator turn", async (t) => {
   const controller = new WorkflowController({
     stateDir: fixture.stateDir,
     runner,
-    leaseMs: 20,
+    leaseMs: 60_000,
   });
   t.after(() => controller.close());
 
@@ -1185,6 +1274,7 @@ test("resumes interrupted fast-path Worker and Verifier turns", async (t) => {
         kind: "start",
         threadId: "fast-recovery-worker",
         startedBeforeError: true,
+        result: "# Result\n\nstale interrupted result\n",
         error: new WorkflowInterruptedError(),
       },
     ],
@@ -1207,7 +1297,7 @@ test("resumes interrupted fast-path Worker and Verifier turns", async (t) => {
   const workerController = new WorkflowController({
     stateDir: fixture.stateDir,
     runner: workerRunner,
-    leaseMs: 20,
+    leaseMs: 60_000,
   });
   const workerOutput = await workerController.run({
     workflow_id: workerWorkflowId,
@@ -1218,6 +1308,13 @@ test("resumes interrupted fast-path Worker and Verifier turns", async (t) => {
   });
   assert.equal(workerOutput.status, "completed");
   assert.match(workerRunner.calls[0]?.prompt ?? "", /bounded single-Worker turn/);
+  assert.doesNotMatch(
+    readFileSync(
+      join(workerOutput.task_dir, "workers", "worker-1", "result.md"),
+      "utf8",
+    ),
+    /stale interrupted result/,
+  );
   workerController.close();
 
   await expectInterruptedRun(
@@ -1250,7 +1347,7 @@ test("resumes interrupted fast-path Worker and Verifier turns", async (t) => {
   const verifierController = new WorkflowController({
     stateDir: fixture.stateDir,
     runner: verifierRunner,
-    leaseMs: 20,
+    leaseMs: 60_000,
   });
   const verifierOutput = await verifierController.run({
     workflow_id: verifierWorkflowId,
@@ -1380,8 +1477,224 @@ test("allows only one Controller lease holder for a running workflow", (t) => {
     [],
     emptyUsage(),
   );
-  assert.equal(first.store.claimWorkflow(workflowId, "owner-a", 60_000), true);
-  assert.equal(second.store.claimWorkflow(workflowId, "owner-b", 60_000), false);
-  first.store.releaseWorkflow(workflowId, "owner-a");
-  assert.equal(second.store.claimWorkflow(workflowId, "owner-b", 60_000), true);
+  const firstLease = first.store.claimWorkflow(workflowId, "owner-a", 60_000);
+  assert.ok(firstLease);
+  assert.equal(second.store.claimWorkflow(workflowId, "owner-b", 60_000), null);
+  first.store.releaseWorkflow(firstLease);
+  assert.ok(second.store.claimWorkflow(workflowId, "owner-b", 60_000));
+});
+
+test("fences a stale Controller after lease takeover", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  const staleRunner = new DeferredPlanningRunner();
+  const stale = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: staleRunner,
+    leaseMs: 60_000,
+  });
+  const winnerRunner = new FakeAgentRunner([
+    {
+      kind: "continue",
+      threadId: "takeover-orchestrator",
+      output: readyPlan(),
+      usage: planUsage,
+    },
+    {
+      kind: "start",
+      threadId: "takeover-worker",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "takeover-verifier",
+      output: passedVerification(),
+      usage: verifierUsage,
+    },
+    {
+      kind: "continue",
+      threadId: "takeover-orchestrator",
+      output: finalCompletion("takeover winner completed"),
+      usage: orchestratorCumulativeUsage,
+    },
+  ]);
+  const winner = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: winnerRunner,
+    leaseMs: 60_000,
+  });
+  t.after(() => {
+    stale.close();
+    winner.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  const stalePromise = stale.run({
+    workflow_id: workflowId,
+    request: "Exercise Controller takeover fencing",
+    workspace: fixture.workspace,
+  });
+  await staleRunner.started;
+  stale.store.database
+    .prepare("UPDATE workflows SET lease_expires_at = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", workflowId);
+
+  const winnerOutput = await winner.run({
+    workflow_id: workflowId,
+    request: "Exercise Controller takeover fencing",
+    workspace: fixture.workspace,
+  });
+  staleRunner.complete(
+    readyPlan({ summary: "stale Controller should be ignored" }),
+    planUsage,
+  );
+  const staleOutput = await stalePromise;
+
+  assert.equal(winnerOutput.summary, "takeover winner completed");
+  assert.deepEqual(staleOutput, winnerOutput);
+  assert.equal(staleRunner.calls.length, 1);
+  const eventTypes = winner.store
+    .listStoredEvents(workflowId)
+    .map((event) => event.type);
+  assert.equal(
+    eventTypes.filter((type) => type === "orchestrator.planned").length,
+    1,
+  );
+  assert.equal(
+    eventTypes.filter((type) => type === "worker.completed").length,
+    1,
+  );
+  assert.equal(
+    eventTypes.filter((type) => type === "verifier.completed").length,
+    1,
+  );
+  assert.equal(
+    winner.store.listStoredAgentRuns(workflowId).filter(
+      (run) => run.role === "verifier",
+    ).length,
+    1,
+  );
+});
+
+test("requires user approval after an upstream cyber_policy classification", async (t) => {
+  const fixture = createFixture();
+  const message =
+    "Codex stream failed: This content was flagged for possible cybersecurity risk. " +
+    "If this seems wrong, try rephrasing your request. To get authorized for " +
+    "security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: new FakeAgentRunner([
+      { kind: "start", error: new Error(message) },
+    ]),
+  });
+  t.after(() => {
+    controller.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  const output = await controller.run({
+    request: "Perform an ordinary authorized review",
+    workspace: fixture.workspace,
+  });
+
+  assert.equal(output.status, "failed");
+  assert.equal(output.failure_kind, "cyber_policy");
+  assert.equal(output.recovery_requires_user_approval, true);
+  assert.equal(output.retry_route, null);
+  assert.equal(output.usage_status, "unknown");
+  assert.deepEqual(output.usage, emptyUsage());
+  assert.equal(
+    controller.store.latestEvent<Record<string, unknown>>(
+      output.workflow_id,
+      "workflow.execution_failed",
+    )?.payload.failure_kind,
+    "cyber_policy",
+  );
+  const decisionId = randomUUID();
+  const decision = controller.recordRecoveryDecision({
+    workflow_id: output.workflow_id,
+    decision_id: decisionId,
+    decision: "approved",
+    note: "User explicitly approved a semantically different recovery attempt.",
+  });
+  assert.equal(decision.decision, "approved");
+  assert.equal(
+    controller.store.latestEvent<Record<string, unknown>>(
+      output.workflow_id,
+      "workflow.recovery_approved",
+    )?.payload.decision_id,
+    decisionId,
+  );
+  assert.deepEqual(
+    controller.recordRecoveryDecision({
+      workflow_id: output.workflow_id,
+      decision_id: decisionId,
+      decision: "approved",
+      note: "User explicitly approved a semantically different recovery attempt.",
+    }),
+    decision,
+  );
+  assert.throws(
+    () =>
+      controller.recordRecoveryDecision({
+        workflow_id: output.workflow_id,
+        decision_id: decisionId,
+        decision: "denied",
+      }),
+    /already recorded with different content/,
+  );
+});
+
+test("keeps usage unknown when a failed workflow has no usage snapshot", async (t) => {
+  const fixture = createFixture();
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: new FakeAgentRunner([
+      { kind: "start", error: new Error("failed before usage") },
+    ]),
+  });
+  t.after(() => {
+    controller.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  const output = await controller.run({
+    request: "Fail before usage is reported",
+    workspace: fixture.workspace,
+  });
+  assert.equal(output.usage_status, "unknown");
+  assert.deepEqual(output.usage, emptyUsage());
+});
+
+test("classifies an explicit caller abort as cancelled", async (t) => {
+  const fixture = createFixture();
+  const runner = new AbortableRunner();
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+  });
+  const abort = new AbortController();
+  t.after(() => {
+    controller.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  const pending = controller.run(
+    {
+      request: "Cancel this workflow while its first turn is running",
+      workspace: fixture.workspace,
+    },
+    abort.signal,
+  );
+  await runner.started;
+  abort.abort();
+  const output = await pending;
+
+  assert.equal(output.status, "cancelled");
+  assert.equal(output.failure_kind, null);
+  assert.equal(output.recovery_requires_user_approval, false);
+  assert.equal(output.usage_status, "unknown");
+  assert.equal(controller.store.listStoredAgentRuns(output.workflow_id)[0]?.status, "cancelled");
 });

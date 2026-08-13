@@ -93,3 +93,25 @@ test("pre-compaction checkpoint omits a newly written unfinished result", (t) =>
     false,
   );
 });
+
+test("finds checkpoints only from the requested lease epoch", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "agent-workflow-epoch-"));
+  const workTree = join(root, "task");
+  const agentDir = join(workTree, "orchestrator");
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(join(agentDir, "task.md"), "# Task\n\nEpoch test\n", "utf8");
+  writeFileSync(join(agentDir, "journal.md"), "# Journal\n\nEpoch one\n", "utf8");
+  const repository = new CheckpointRepository({
+    workTree,
+    gitDir: join(root, "history.git"),
+  });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const first = repository.commit("worker.completed", { leaseEpoch: 1 });
+  writeFileSync(join(agentDir, "journal.md"), "# Journal\n\nEpoch two\n", "utf8");
+  const second = repository.commit("worker.completed", { leaseEpoch: 2 });
+
+  assert.deepEqual(repository.findCommit("worker.completed", 1), first);
+  assert.deepEqual(repository.findCommit("worker.completed", 2), second);
+  assert.equal(repository.findCommit("worker.completed", 3), null);
+});

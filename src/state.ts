@@ -6,17 +6,22 @@ import {
   emptyUsage,
   executionRouteSchema,
   modelProfileSchema,
+  modelProfiles,
   roleSchema,
   usageSchema,
+  usageStatusSchema,
   workflowRunOutputSchema,
   type AgentRole,
   type AgentUsage,
   type ExecutionRoute,
   type ModelProfile,
+  type RecoveryDecisionInput,
+  type RecoveryDecisionOutput,
+  type UsageStatus,
   type WorkflowRunOutput,
 } from "./contracts.js";
 
-export type AgentRunStatus = "running" | "completed" | "failed";
+export type AgentRunStatus = "running" | "completed" | "failed" | "cancelled";
 
 export interface CreateAgentRun {
   id: string;
@@ -25,6 +30,23 @@ export interface CreateAgentRun {
   role: AgentRole;
   profile: ModelProfile;
   taskDir: string;
+  model: string;
+  reasoningEffort: "high" | "max";
+  requestedServiceTier: string;
+}
+
+export interface WorkflowLease {
+  workflowId: string;
+  owner: string;
+  epoch: number;
+  claimedAt: string;
+}
+
+export class WorkflowLeaseLostError extends Error {
+  constructor(workflowId: string) {
+    super(`Controller lease was lost for workflow ${workflowId}`);
+    this.name = "WorkflowLeaseLostError";
+  }
 }
 
 export interface StoredWorkflow {
@@ -40,8 +62,15 @@ export interface StoredWorkflow {
   questions: string[];
   blocker: string | null;
   usage: AgentUsage;
+  usageStatus: UsageStatus;
+  failureKind: string | null;
+  recoveryRequiresUserApproval: boolean;
   leaseOwner: string | null;
+  leaseEpoch: number;
+  leaseClaimedAt: string | null;
   leaseExpiresAt: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface StoredAgentRun {
@@ -50,11 +79,19 @@ export interface StoredAgentRun {
   parentRunId: string | null;
   role: AgentRole;
   profile: ModelProfile;
+  model: string;
+  reasoningEffort: "high" | "max";
+  requestedServiceTier: string;
+  effectiveServiceTier: string | null;
   taskDir: string;
   threadId: string | null;
   status: AgentRunStatus;
   usage: AgentUsage;
+  usageStatus: UsageStatus;
   error: string | null;
+  errorKind: string | null;
+  startedAt: string;
+  completedAt: string | null;
 }
 
 export interface StoredEvent<T = unknown> {
@@ -64,6 +101,19 @@ export interface StoredEvent<T = unknown> {
   type: string;
   payload: T;
   createdAt: string;
+}
+
+export interface StoredCheckpoint {
+  sequence: number;
+  workflowId: string;
+  runId: string | null;
+  kind: string;
+  commitId: string;
+  createdAt: string;
+}
+
+export interface StateStoreOptions {
+  readOnly?: boolean;
 }
 
 function parseJson<T>(raw: unknown, fallback: T): T {
@@ -91,9 +141,19 @@ function rowToWorkflow(row: Record<string, unknown>): StoredWorkflow {
     questions: parseJson(row.questions_json, []),
     blocker: row.blocker === null ? null : String(row.blocker),
     usage: parseUsage(row.usage_json),
+    usageStatus: usageStatusSchema.parse(row.usage_status),
+    failureKind:
+      row.failure_kind === null ? null : String(row.failure_kind),
+    recoveryRequiresUserApproval:
+      Number(row.recovery_requires_user_approval) === 1,
     leaseOwner: row.lease_owner === null ? null : String(row.lease_owner),
+    leaseEpoch: Number(row.lease_epoch),
+    leaseClaimedAt:
+      row.lease_claimed_at === null ? null : String(row.lease_claimed_at),
     leaseExpiresAt:
       row.lease_expires_at === null ? null : String(row.lease_expires_at),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
   };
 }
 
@@ -105,23 +165,44 @@ function rowToAgentRun(row: Record<string, unknown>): StoredAgentRun {
       row.parent_run_id === null ? null : String(row.parent_run_id),
     role: roleSchema.parse(row.role),
     profile: modelProfileSchema.parse(row.profile),
+    model: String(row.model),
+    reasoningEffort:
+      row.reasoning_effort === "max" ? "max" : "high",
+    requestedServiceTier: String(row.requested_service_tier),
+    effectiveServiceTier:
+      row.effective_service_tier === null
+        ? null
+        : String(row.effective_service_tier),
     taskDir: String(row.task_dir),
     threadId: row.thread_id === null ? null : String(row.thread_id),
     status: String(row.status) as AgentRunStatus,
     usage: parseUsage(row.usage_json),
+    usageStatus: usageStatusSchema.parse(row.usage_status),
     error: row.error === null ? null : String(row.error),
+    errorKind: row.error_kind === null ? null : String(row.error_kind),
+    startedAt: String(row.started_at),
+    completedAt:
+      row.completed_at === null ? null : String(row.completed_at),
   };
 }
 
 export class StateStore {
   readonly database: DatabaseSync;
 
-  constructor(databasePath: string) {
-    mkdirSync(dirname(databasePath), { recursive: true });
-    this.database = new DatabaseSync(databasePath);
-    this.database.exec("PRAGMA journal_mode = WAL");
+  constructor(databasePath: string, options: StateStoreOptions = {}) {
+    if (!options.readOnly) {
+      mkdirSync(dirname(databasePath), { recursive: true });
+    }
+    this.database = new DatabaseSync(databasePath, {
+      readOnly: options.readOnly ?? false,
+      timeout: 5000,
+    });
     this.database.exec("PRAGMA busy_timeout = 5000");
     this.database.exec("PRAGMA foreign_keys = ON");
+    if (options.readOnly) {
+      return;
+    }
+    this.database.exec("PRAGMA journal_mode = WAL");
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS workflows (
         id TEXT PRIMARY KEY,
@@ -136,7 +217,12 @@ export class StateStore {
         questions_json TEXT NOT NULL DEFAULT '[]',
         blocker TEXT,
         usage_json TEXT NOT NULL,
+        usage_status TEXT NOT NULL DEFAULT 'unknown',
+        failure_kind TEXT,
+        recovery_requires_user_approval INTEGER NOT NULL DEFAULT 0,
         lease_owner TEXT,
+        lease_epoch INTEGER NOT NULL DEFAULT 0,
+        lease_claimed_at TEXT,
         lease_expires_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -148,11 +234,17 @@ export class StateStore {
         parent_run_id TEXT REFERENCES agent_runs(id),
         role TEXT NOT NULL,
         profile TEXT NOT NULL,
+        model TEXT NOT NULL,
+        reasoning_effort TEXT NOT NULL,
+        requested_service_tier TEXT NOT NULL DEFAULT 'default',
+        effective_service_tier TEXT,
         task_dir TEXT NOT NULL,
         thread_id TEXT,
         status TEXT NOT NULL,
         usage_json TEXT,
+        usage_status TEXT NOT NULL DEFAULT 'unknown',
         error TEXT,
+        error_kind TEXT,
         started_at TEXT NOT NULL,
         completed_at TEXT
       );
@@ -178,10 +270,87 @@ export class StateStore {
     this.ensureAgentRunProfileColumn();
     this.ensureWorkflowExecutionRouteColumn();
     this.ensureWorkflowRecoveryColumns();
+    this.ensureAgentRunTraceColumns();
+    this.ensureWorkflowTraceColumns();
   }
 
   close(): void {
     this.database.close();
+  }
+
+  assertWorkflowLease(lease: WorkflowLease): void {
+    const row = this.database
+      .prepare(`
+        SELECT 1
+        FROM workflows
+        WHERE id = ? AND status = 'running'
+          AND lease_owner = ? AND lease_epoch = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+      `)
+      .get(
+        lease.workflowId,
+        lease.owner,
+        lease.epoch,
+        new Date().toISOString(),
+      );
+    if (row === undefined) {
+      throw new WorkflowLeaseLostError(lease.workflowId);
+    }
+  }
+
+  private withWorkflowLease<T>(
+    lease: WorkflowLease,
+    operation: () => T,
+  ): T {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertWorkflowLease(lease);
+      const result = operation();
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        // Preserve the original state mutation failure.
+      }
+      throw error;
+    }
+  }
+
+  private insertEvent(
+    workflowId: string,
+    runId: string | null,
+    type: string,
+    payload: unknown,
+  ): void {
+    this.database
+      .prepare(`
+        INSERT INTO events (workflow_id, run_id, type, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `)
+      .run(
+        workflowId,
+        runId,
+        type,
+        JSON.stringify(payload),
+        new Date().toISOString(),
+      );
+  }
+
+  private insertCheckpoint(
+    workflowId: string,
+    runId: string | null,
+    kind: string,
+    commitId: string,
+  ): void {
+    this.database
+      .prepare(`
+        INSERT INTO checkpoints (
+          workflow_id, run_id, kind, commit_id, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `)
+      .run(workflowId, runId, kind, commitId, new Date().toISOString());
   }
 
   createWorkflow(
@@ -239,16 +408,18 @@ export class StateStore {
     return Number(inserted.changes) === 1;
   }
 
-  finishWorkflow(output: WorkflowRunOutput): void {
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
+  finishWorkflow(lease: WorkflowLease, output: WorkflowRunOutput): void {
+    this.withWorkflowLease(lease, () => {
       const updated = this.database
         .prepare(`
           UPDATE workflows
           SET status = ?, summary = ?, result_path = ?, questions_json = ?, blocker = ?,
-              usage_json = ?, lease_owner = NULL, lease_expires_at = NULL,
+              usage_json = ?, usage_status = ?, failure_kind = ?,
+              recovery_requires_user_approval = ?,
+              lease_owner = NULL, lease_claimed_at = NULL, lease_expires_at = NULL,
               updated_at = ?
           WHERE id = ? AND status = 'running'
+            AND lease_owner = ? AND lease_epoch = ?
         `)
         .run(
           output.status,
@@ -257,31 +428,20 @@ export class StateStore {
           JSON.stringify(output.questions),
           output.blocker,
           JSON.stringify(output.usage),
+          output.usage_status,
+          output.failure_kind,
+          output.recovery_requires_user_approval ? 1 : 0,
           new Date().toISOString(),
           output.workflow_id,
+          lease.owner,
+          lease.epoch,
         );
       if (Number(updated.changes) !== 1) {
-        const existing = this.database
-          .prepare("SELECT status FROM workflows WHERE id = ?")
-          .get(output.workflow_id) as { status: string } | undefined;
-        if (existing === undefined) {
-          throw new Error(`Unknown workflow: ${output.workflow_id}`);
-        }
-        throw new Error(
-          `Workflow ${output.workflow_id} already has terminal outcome ${existing.status}`,
-        );
+        throw new WorkflowLeaseLostError(output.workflow_id);
       }
 
-      this.appendEvent(output.workflow_id, null, "workflow.terminal", output);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        // Preserve the original terminal-state failure.
-      }
-      throw error;
-    }
+      this.insertEvent(output.workflow_id, null, "workflow.terminal", output);
+    });
   }
 
   terminalOutput(id: string): WorkflowRunOutput | null {
@@ -298,8 +458,12 @@ export class StateStore {
       questions: workflow.questions,
       blocker: workflow.blocker,
       usage: workflow.usage,
+      usage_status: workflow.usageStatus,
       execution_route: workflow.executionRoute,
       retry_route: this.terminalRetryRoute(id),
+      failure_kind: workflow.failureKind,
+      recovery_requires_user_approval:
+        workflow.recoveryRequiresUserApproval,
     });
   }
 
@@ -313,209 +477,376 @@ export class StateStore {
       : null;
   }
 
-  claimWorkflow(id: string, owner: string, leaseMs: number): boolean {
+  claimWorkflow(
+    id: string,
+    owner: string,
+    leaseMs: number,
+  ): WorkflowLease | null {
     const now = new Date();
+    const claimedAt = now.toISOString();
     const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
-    const updated = this.database
+    const claimed = this.database
       .prepare(`
         UPDATE workflows
-        SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
+        SET lease_owner = ?, lease_epoch = lease_epoch + 1,
+            lease_claimed_at = ?, lease_expires_at = ?, updated_at = ?
         WHERE id = ? AND status = 'running'
           AND (
-            lease_owner IS NULL OR lease_owner = ? OR lease_expires_at IS NULL OR
+            lease_owner IS NULL OR lease_expires_at IS NULL OR
             lease_expires_at <= ?
           )
+        RETURNING lease_epoch
       `)
-      .run(owner, expiresAt, now.toISOString(), id, owner, now.toISOString());
-    return Number(updated.changes) === 1;
+      .get(owner, claimedAt, expiresAt, claimedAt, id, claimedAt) as
+      | { lease_epoch: number }
+      | undefined;
+    return claimed === undefined
+      ? null
+      : {
+          workflowId: id,
+          owner,
+          epoch: Number(claimed.lease_epoch),
+          claimedAt,
+        };
   }
 
-  heartbeatWorkflow(id: string, owner: string, leaseMs: number): boolean {
+  heartbeatWorkflow(lease: WorkflowLease, leaseMs: number): boolean {
     const now = new Date();
     const updated = this.database
       .prepare(`
         UPDATE workflows
         SET lease_expires_at = ?, updated_at = ?
-        WHERE id = ? AND status = 'running' AND lease_owner = ?
+        WHERE id = ? AND status = 'running'
+          AND lease_owner = ? AND lease_epoch = ?
       `)
       .run(
         new Date(now.getTime() + leaseMs).toISOString(),
         now.toISOString(),
-        id,
-        owner,
+        lease.workflowId,
+        lease.owner,
+        lease.epoch,
       );
     return Number(updated.changes) === 1;
   }
 
-  releaseWorkflow(id: string, owner: string): void {
+  releaseWorkflow(lease: WorkflowLease): void {
     this.database
       .prepare(`
         UPDATE workflows
-        SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-        WHERE id = ? AND lease_owner = ?
-      `)
-      .run(new Date().toISOString(), id, owner);
-  }
-
-  updateWorkflowUsage(id: string, usage: AgentUsage): void {
-    this.database
-      .prepare(`
-        UPDATE workflows
-        SET usage_json = ?, updated_at = ?
-        WHERE id = ? AND status = 'running'
-      `)
-      .run(JSON.stringify(usage), new Date().toISOString(), id);
-  }
-
-  updateAgentUsage(runId: string, usage: AgentUsage): void {
-    this.database
-      .prepare(`
-        UPDATE agent_runs
-        SET usage_json = ?
-        WHERE id = ? AND status = 'running'
-      `)
-      .run(JSON.stringify(usage), runId);
-  }
-
-  recordAgentProgress(
-    runId: string,
-    usage: AgentUsage,
-    eventType: string,
-    payload: unknown,
-  ): void {
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      const row = this.database
-        .prepare("SELECT workflow_id FROM agent_runs WHERE id = ?")
-        .get(runId) as { workflow_id: string } | undefined;
-      if (row === undefined) {
-        throw new Error(`Unknown agent run: ${runId}`);
-      }
-      this.updateAgentUsage(runId, usage);
-      this.appendEvent(row.workflow_id, runId, eventType, payload);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        // Preserve the original progress failure.
-      }
-      throw error;
-    }
-  }
-
-  createAgentRun(input: CreateAgentRun): void {
-    this.database
-      .prepare(`
-        INSERT INTO agent_runs (
-          id, workflow_id, parent_run_id, role, profile, task_dir, status,
-          usage_json, started_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)
+        SET lease_owner = NULL, lease_claimed_at = NULL,
+            lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
       `)
       .run(
-        input.id,
-        input.workflowId,
-        input.parentRunId,
-        input.role,
-        input.profile,
-        input.taskDir,
-        JSON.stringify(emptyUsage()),
         new Date().toISOString(),
+        lease.workflowId,
+        lease.owner,
+        lease.epoch,
       );
   }
 
-  setAgentThread(runId: string, threadId: string): void {
-    this.database
-      .prepare(`
-        UPDATE agent_runs
-        SET thread_id = ?
-        WHERE id = ? AND status = 'running'
-      `)
-      .run(threadId, runId);
-  }
-
-  finishAgentRun(
-    runId: string,
-    status: AgentRunStatus,
-    usage: AgentUsage,
-    error: string | null = null,
-  ): void {
-    this.database
-      .prepare(`
-        UPDATE agent_runs
-        SET status = ?, usage_json = ?, error = ?, completed_at = ?
-        WHERE id = ?
-      `)
-      .run(status, JSON.stringify(usage), error, new Date().toISOString(), runId);
-  }
-
-  completeAgentRun(
-    runId: string,
-    usage: AgentUsage,
-    eventType: string,
-    payload: unknown,
-  ): void {
+  recordRecoveryDecision(
+    input: RecoveryDecisionInput,
+  ): RecoveryDecisionOutput {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      const workflow = this.getStoredWorkflow(input.workflow_id);
+      if (
+        workflow === undefined ||
+        workflow.status !== "failed" ||
+        workflow.failureKind !== "cyber_policy" ||
+        !workflow.recoveryRequiresUserApproval
+      ) {
+        throw new Error(
+          `Workflow ${input.workflow_id} is not awaiting a cyber_policy recovery decision`,
+        );
+      }
+      const existing = this.database
+        .prepare(`
+          SELECT type, payload_json, created_at
+          FROM events
+          WHERE workflow_id = ?
+            AND type IN ('workflow.recovery_approved', 'workflow.recovery_denied')
+            AND json_extract(payload_json, '$.decision_id') = ?
+          ORDER BY sequence DESC LIMIT 1
+        `)
+        .get(input.workflow_id, input.decision_id) as
+        | { type: string; payload_json: string; created_at: string }
+        | undefined;
+      if (existing !== undefined) {
+        const payload = parseJson<Record<string, unknown>>(
+          existing.payload_json,
+          {},
+        );
+        const existingDecision =
+          existing.type === "workflow.recovery_approved"
+            ? "approved"
+            : "denied";
+        if (
+          existingDecision !== input.decision ||
+          (payload.note ?? undefined) !== input.note
+        ) {
+          throw new Error(
+            `Recovery decision ${input.decision_id} was already recorded with different content`,
+          );
+        }
+        this.database.exec("COMMIT");
+        return {
+          workflow_id: input.workflow_id,
+          decision_id: input.decision_id,
+          decision: existingDecision,
+          recorded_at: existing.created_at,
+        };
+      }
+
+      const recordedAt = new Date().toISOString();
+      this.database
+        .prepare(`
+          INSERT INTO events (workflow_id, run_id, type, payload_json, created_at)
+          VALUES (?, NULL, ?, ?, ?)
+        `)
+        .run(
+          input.workflow_id,
+          input.decision === "approved"
+            ? "workflow.recovery_approved"
+            : "workflow.recovery_denied",
+          JSON.stringify({
+            decision_id: input.decision_id,
+            decision: input.decision,
+            ...(input.note === undefined ? {} : { note: input.note }),
+          }),
+          recordedAt,
+        );
+      this.database.exec("COMMIT");
+      return {
+        workflow_id: input.workflow_id,
+        decision_id: input.decision_id,
+        decision: input.decision,
+        recorded_at: recordedAt,
+      };
+    } catch (error) {
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        // Preserve the original validation or persistence failure.
+      }
+      throw error;
+    }
+  }
+
+  recordAgentProgress(
+    lease: WorkflowLease,
+    runId: string,
+    usage: AgentUsage,
+    usageStatus: UsageStatus,
+    eventType: string,
+    payload: unknown,
+    effectiveServiceTier?: string | null,
+  ): void {
+    this.withWorkflowLease(lease, () => {
       const row = this.database
         .prepare("SELECT workflow_id FROM agent_runs WHERE id = ?")
         .get(runId) as { workflow_id: string } | undefined;
       if (row === undefined) {
         throw new Error(`Unknown agent run: ${runId}`);
       }
-      this.database
+      if (row.workflow_id !== lease.workflowId) {
+        throw new Error(`Agent run ${runId} belongs to another workflow`);
+      }
+      const updated = this.database
         .prepare(`
           UPDATE agent_runs
-          SET status = 'completed', usage_json = ?, error = NULL,
-              completed_at = ?
-          WHERE id = ?
+          SET usage_json = ?, usage_status = ?,
+              effective_service_tier = COALESCE(?, effective_service_tier)
+          WHERE id = ? AND status = 'running'
         `)
-        .run(JSON.stringify(usage), new Date().toISOString(), runId);
-      this.appendEvent(row.workflow_id, runId, eventType, payload);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        // Preserve the original completion failure.
+        .run(
+          JSON.stringify(usage),
+          usageStatus,
+          effectiveServiceTier ?? null,
+          runId,
+        );
+      if (Number(updated.changes) !== 1) {
+        throw new Error(`Agent run is not running: ${runId}`);
       }
-      throw error;
+      this.insertEvent(row.workflow_id, runId, eventType, payload);
+    });
+  }
+
+  createAgentRun(lease: WorkflowLease, input: CreateAgentRun): void {
+    if (input.workflowId !== lease.workflowId) {
+      throw new Error("Cannot create an Agent run under another Workflow lease");
     }
+    this.withWorkflowLease(lease, () => {
+      const startedAt = new Date().toISOString();
+      this.database
+        .prepare(`
+          INSERT INTO agent_runs (
+            id, workflow_id, parent_run_id, role, profile, model,
+            reasoning_effort, requested_service_tier, task_dir, status,
+            usage_json, usage_status, started_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, 'unknown', ?)
+        `)
+        .run(
+          input.id,
+          input.workflowId,
+          input.parentRunId,
+          input.role,
+          input.profile,
+          input.model,
+          input.reasoningEffort,
+          input.requestedServiceTier,
+          input.taskDir,
+          JSON.stringify(emptyUsage()),
+          startedAt,
+        );
+      this.insertEvent(input.workflowId, input.id, "agent.dispatched", {
+        parent_run_id: input.parentRunId,
+        role: input.role,
+        profile: input.profile,
+        model: input.model,
+        reasoning_effort: input.reasoningEffort,
+        requested_service_tier: input.requestedServiceTier,
+        task_dir: input.taskDir,
+      });
+    });
+  }
+
+  setAgentThread(
+    lease: WorkflowLease,
+    runId: string,
+    threadId: string,
+    recoveredFromCompletedTurn = false,
+  ): void {
+    this.withWorkflowLease(lease, () => {
+      const updated = this.database
+        .prepare(`
+          UPDATE agent_runs
+          SET thread_id = ?
+          WHERE id = ? AND workflow_id = ? AND status = 'running'
+        `)
+        .run(threadId, runId, lease.workflowId);
+      if (Number(updated.changes) !== 1) {
+        throw new Error(`Agent run is not running: ${runId}`);
+      }
+      this.insertEvent(lease.workflowId, runId, "agent.thread_started", {
+        thread_id: threadId,
+        ...(recoveredFromCompletedTurn
+          ? { recovered_from_completed_turn: true }
+          : {}),
+      });
+    });
+  }
+
+  finishAgentRun(
+    lease: WorkflowLease,
+    runId: string,
+    status: AgentRunStatus,
+    usage: AgentUsage,
+    usageStatus: UsageStatus,
+    error: string | null = null,
+    errorKind: string | null = null,
+  ): void {
+    this.withWorkflowLease(lease, () => {
+      const updated = this.database
+        .prepare(`
+          UPDATE agent_runs
+          SET status = ?, usage_json = ?, usage_status = ?, error = ?,
+              error_kind = ?, completed_at = ?
+          WHERE id = ? AND workflow_id = ? AND status = 'running'
+        `)
+        .run(
+          status,
+          JSON.stringify(usage),
+          usageStatus,
+          error,
+          errorKind,
+          new Date().toISOString(),
+          runId,
+          lease.workflowId,
+        );
+      if (Number(updated.changes) !== 1) {
+        throw new Error(`Agent run is not running: ${runId}`);
+      }
+      this.insertEvent(lease.workflowId, runId, `agent.${status}`, {
+        usage,
+        usage_status: usageStatus,
+        error,
+        error_kind: errorKind,
+      });
+    });
+  }
+
+  completeAgentRun(
+    lease: WorkflowLease,
+    runId: string,
+    usage: AgentUsage,
+    usageStatus: UsageStatus,
+    eventType: string,
+    payload: unknown,
+    effectiveServiceTier?: string | null,
+  ): void {
+    this.withWorkflowLease(lease, () => {
+      const row = this.database
+        .prepare("SELECT workflow_id FROM agent_runs WHERE id = ?")
+        .get(runId) as { workflow_id: string } | undefined;
+      if (row === undefined) {
+        throw new Error(`Unknown agent run: ${runId}`);
+      }
+      if (row.workflow_id !== lease.workflowId) {
+        throw new Error(`Agent run ${runId} belongs to another workflow`);
+      }
+      const updated = this.database
+        .prepare(`
+          UPDATE agent_runs
+          SET status = 'completed', usage_json = ?, usage_status = ?,
+              effective_service_tier = COALESCE(?, effective_service_tier),
+              error = NULL, error_kind = NULL, completed_at = ?
+          WHERE id = ? AND status = 'running'
+        `)
+        .run(
+          JSON.stringify(usage),
+          usageStatus,
+          effectiveServiceTier ?? null,
+          new Date().toISOString(),
+          runId,
+        );
+      if (Number(updated.changes) !== 1) {
+        throw new Error(`Agent run is not running: ${runId}`);
+      }
+      this.insertEvent(row.workflow_id, runId, eventType, payload);
+      this.insertEvent(row.workflow_id, runId, "agent.completed", {
+        usage,
+        usage_status: usageStatus,
+      });
+    });
   }
 
   appendEvent(
-    workflowId: string,
+    lease: WorkflowLease,
     runId: string | null,
     type: string,
     payload: unknown,
   ): void {
-    this.database
-      .prepare(`
-        INSERT INTO events (workflow_id, run_id, type, payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `)
-      .run(
-        workflowId,
-        runId,
-        type,
-        JSON.stringify(payload),
-        new Date().toISOString(),
-      );
+    this.withWorkflowLease(lease, () => {
+      this.insertEvent(lease.workflowId, runId, type, payload);
+    });
   }
 
   recordCheckpoint(
-    workflowId: string,
+    lease: WorkflowLease,
     runId: string | null,
     kind: string,
     commitId: string,
+    eventType = "checkpoint.committed",
   ): void {
-    this.database
-      .prepare(`
-        INSERT INTO checkpoints (
-          workflow_id, run_id, kind, commit_id, created_at
-        ) VALUES (?, ?, ?, ?, ?)
-      `)
-      .run(workflowId, runId, kind, commitId, new Date().toISOString());
+    this.withWorkflowLease(lease, () => {
+      this.insertCheckpoint(lease.workflowId, runId, kind, commitId);
+      this.insertEvent(lease.workflowId, runId, eventType, {
+        kind,
+        commit_id: commitId,
+      });
+    });
   }
 
   getStoredWorkflow(id: string): StoredWorkflow | undefined {
@@ -540,6 +871,47 @@ export class StateStore {
         )
         .all(workflowId) as Record<string, unknown>[]
     ).map(rowToAgentRun);
+  }
+
+  listStoredEvents(workflowId: string): StoredEvent[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT * FROM events WHERE workflow_id = ? ORDER BY sequence",
+        )
+        .all(workflowId) as Record<string, unknown>[]
+    ).map((row) => ({
+      sequence: Number(row.sequence),
+      workflowId: String(row.workflow_id),
+      runId: row.run_id === null ? null : String(row.run_id),
+      type: String(row.type),
+      payload: parseJson(row.payload_json, null),
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  listStoredCheckpoints(workflowId: string): StoredCheckpoint[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT * FROM checkpoints WHERE workflow_id = ? ORDER BY sequence",
+        )
+        .all(workflowId) as Record<string, unknown>[]
+    ).map((row) => ({
+      sequence: Number(row.sequence),
+      workflowId: String(row.workflow_id),
+      runId: row.run_id === null ? null : String(row.run_id),
+      kind: String(row.kind),
+      commitId: String(row.commit_id),
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  latestWorkflowId(): string | null {
+    const row = this.database
+      .prepare("SELECT id FROM workflows ORDER BY created_at DESC, id DESC LIMIT 1")
+      .get() as { id: string } | undefined;
+    return row?.id ?? null;
   }
 
   latestEvent<T = unknown>(
@@ -648,5 +1020,139 @@ export class StateStore {
         "ALTER TABLE workflows ADD COLUMN lease_expires_at TEXT",
       );
     }
+  }
+
+  private ensureWorkflowTraceColumns(): void {
+    const columns = this.database
+      .prepare("PRAGMA table_info(workflows)")
+      .all() as { name: string }[];
+    const names = new Set(columns.map((column) => column.name));
+    if (!names.has("usage_status")) {
+      this.database.exec(
+        "ALTER TABLE workflows ADD COLUMN usage_status TEXT NOT NULL DEFAULT 'unknown'",
+      );
+    }
+    if (!names.has("failure_kind")) {
+      this.database.exec("ALTER TABLE workflows ADD COLUMN failure_kind TEXT");
+    }
+    if (!names.has("recovery_requires_user_approval")) {
+      this.database.exec(
+        "ALTER TABLE workflows ADD COLUMN recovery_requires_user_approval INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!names.has("lease_epoch")) {
+      this.database.exec(
+        "ALTER TABLE workflows ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!names.has("lease_claimed_at")) {
+      this.database.exec("ALTER TABLE workflows ADD COLUMN lease_claimed_at TEXT");
+    }
+
+    this.database.exec(`
+      UPDATE workflows
+      SET failure_kind = CASE
+            WHEN status = 'failed' AND (
+              lower(COALESCE(summary, '')) LIKE '%flagged for possible cybersecurity risk%'
+              OR lower(COALESCE(blocker, '')) LIKE '%chatgpt.com/cyber%'
+              OR lower(COALESCE(summary, '')) LIKE '%cyber_policy%'
+            ) THEN 'cyber_policy'
+            WHEN status = 'failed' AND failure_kind IS NULL THEN 'execution_error'
+            ELSE failure_kind
+          END,
+          recovery_requires_user_approval = CASE
+            WHEN status = 'failed' AND (
+              lower(COALESCE(summary, '')) LIKE '%flagged for possible cybersecurity risk%'
+              OR lower(COALESCE(blocker, '')) LIKE '%chatgpt.com/cyber%'
+              OR lower(COALESCE(summary, '')) LIKE '%cyber_policy%'
+            ) THEN 1
+            ELSE recovery_requires_user_approval
+          END
+    `);
+
+    this.database.exec(`
+      UPDATE workflows
+      SET usage_status = CASE
+        WHEN NOT EXISTS (
+          SELECT 1 FROM agent_runs WHERE agent_runs.workflow_id = workflows.id
+        ) THEN 'unknown'
+        WHEN EXISTS (
+          SELECT 1 FROM agent_runs
+          WHERE agent_runs.workflow_id = workflows.id
+            AND agent_runs.usage_status IN ('unknown', 'partial')
+        ) AND EXISTS (
+          SELECT 1 FROM agent_runs
+          WHERE agent_runs.workflow_id = workflows.id
+            AND agent_runs.usage_status IN ('measured', 'partial')
+        ) THEN 'partial'
+        WHEN EXISTS (
+          SELECT 1 FROM agent_runs
+          WHERE agent_runs.workflow_id = workflows.id
+            AND agent_runs.usage_status = 'unknown'
+        ) THEN 'unknown'
+        WHEN EXISTS (
+          SELECT 1 FROM agent_runs
+          WHERE agent_runs.workflow_id = workflows.id
+            AND agent_runs.usage_status = 'partial'
+        ) THEN 'partial'
+        ELSE 'measured'
+      END
+      WHERE usage_status = 'unknown' AND status <> 'running'
+    `);
+  }
+
+  private ensureAgentRunTraceColumns(): void {
+    const columns = this.database
+      .prepare("PRAGMA table_info(agent_runs)")
+      .all() as { name: string }[];
+    const names = new Set(columns.map((column) => column.name));
+    if (!names.has("model")) {
+      this.database.exec(
+        "ALTER TABLE agent_runs ADD COLUMN model TEXT NOT NULL DEFAULT 'gpt-5.6-sol'",
+      );
+    }
+    if (!names.has("reasoning_effort")) {
+      this.database.exec(
+        "ALTER TABLE agent_runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'high'",
+      );
+    }
+    if (!names.has("requested_service_tier")) {
+      this.database.exec(
+        "ALTER TABLE agent_runs ADD COLUMN requested_service_tier TEXT NOT NULL DEFAULT 'default'",
+      );
+    }
+    if (!names.has("effective_service_tier")) {
+      this.database.exec(
+        "ALTER TABLE agent_runs ADD COLUMN effective_service_tier TEXT",
+      );
+    }
+    if (!names.has("usage_status")) {
+      this.database.exec(
+        "ALTER TABLE agent_runs ADD COLUMN usage_status TEXT NOT NULL DEFAULT 'unknown'",
+      );
+    }
+    if (!names.has("error_kind")) {
+      this.database.exec("ALTER TABLE agent_runs ADD COLUMN error_kind TEXT");
+    }
+
+    for (const [profile, definition] of Object.entries(modelProfiles)) {
+      this.database
+        .prepare(`
+          UPDATE agent_runs
+          SET model = ?, reasoning_effort = ?
+          WHERE profile = ?
+        `)
+        .run(definition.model, definition.reasoningEffort, profile);
+    }
+    this.database.exec(`
+      UPDATE agent_runs
+      SET usage_status = CASE
+        WHEN status = 'completed' AND usage_json IS NOT NULL THEN 'measured'
+        WHEN status = 'failed' AND usage_json IS NOT NULL
+          AND usage_json <> '${JSON.stringify(emptyUsage())}' THEN 'partial'
+        ELSE 'unknown'
+      END
+      WHERE usage_status = 'unknown' AND status <> 'running'
+    `);
   }
 }

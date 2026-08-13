@@ -15,10 +15,12 @@ const COMMIT_ID = /^[0-9a-f]{40,64}$/;
 export interface CheckpointCommit {
   id: string;
   kind: string;
+  leaseEpoch?: number;
 }
 
 export interface CheckpointCommitOptions {
   includeNewResults?: boolean;
+  leaseEpoch?: number;
 }
 
 export interface CheckpointRepositoryOptions {
@@ -132,18 +134,28 @@ export class CheckpointRepository {
       throw new Error("Checkpoint repository has no task artifacts");
     }
     this.git(["add", "--", ...files]);
-    this.git([
+    const commitArgs = [
       "commit",
       "--quiet",
       "--allow-empty",
       "--no-gpg-sign",
       "--message",
       `checkpoint: ${kind}`,
-    ]);
+    ];
+    if (options.leaseEpoch !== undefined) {
+      commitArgs.push(
+        "--message",
+        `workflow-lease-epoch: ${options.leaseEpoch}`,
+      );
+    }
+    this.git(commitArgs);
 
     return {
       id: this.git(["rev-parse", "HEAD"]).trim(),
       kind,
+      ...(options.leaseEpoch !== undefined
+        ? { leaseEpoch: options.leaseEpoch }
+        : {}),
     };
   }
 
@@ -196,24 +208,34 @@ export class CheckpointRepository {
     }
   }
 
-  findCommit(kind: string): CheckpointCommit | null {
+  findCommit(kind: string, leaseEpoch?: number): CheckpointCommit | null {
     if (!CHECKPOINT_KIND.test(kind)) {
       throw new Error(`Invalid checkpoint kind: ${kind}`);
     }
     this.initialize();
-    const log = this.gitQuiet(["log", "--format=%H%x00%s"]);
+    const log = this.gitQuiet(["log", "--format=%H%x00%s%x00%b%x00"]);
     if (log === null) {
       return null;
     }
-    for (const line of log.split("\n")) {
-      const separator = line.indexOf("\0");
-      if (separator === -1) {
-        continue;
-      }
-      const id = line.slice(0, separator);
-      const subject = line.slice(separator + 1);
-      if (subject === `checkpoint: ${kind}` && COMMIT_ID.test(id)) {
-        return { id, kind };
+    const fields = log.split("\0");
+    for (let index = 0; index + 2 < fields.length; index += 3) {
+      const id = fields[index]?.trim() ?? "";
+      const subject = fields[index + 1]?.trim() ?? "";
+      const body = fields[index + 2] ?? "";
+      const match = body.match(/(?:^|\n)workflow-lease-epoch: ([0-9]+)(?:\n|$)/);
+      const committedEpoch = match === null ? undefined : Number(match[1]);
+      if (
+        subject === `checkpoint: ${kind}` &&
+        COMMIT_ID.test(id) &&
+        (leaseEpoch === undefined || committedEpoch === leaseEpoch)
+      ) {
+        return {
+          id,
+          kind,
+          ...(committedEpoch === undefined
+            ? {}
+            : { leaseEpoch: committedEpoch }),
+        };
       }
     }
     return null;

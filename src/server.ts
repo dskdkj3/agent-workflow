@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/server";
@@ -9,15 +8,23 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
 import { CodexAgentRunner } from "./agent-runner.js";
 import { WorkflowController } from "./controller.js";
+import { defaultStateDir } from "./state-path.js";
 import {
   workflowRunInputSchema,
   workflowRunOutputSchema,
+  recoveryDecisionInputSchema,
+  recoveryDecisionOutputSchema,
+  type RecoveryDecisionInput,
+  type RecoveryDecisionOutput,
   type WorkflowRunInput,
   type WorkflowRunOutput,
 } from "./contracts.js";
 
 export interface WorkflowService {
   run(input: WorkflowRunInput, signal?: AbortSignal): Promise<WorkflowRunOutput>;
+  recordRecoveryDecision(
+    input: RecoveryDecisionInput,
+  ): RecoveryDecisionOutput | Promise<RecoveryDecisionOutput>;
 }
 
 export function createWorkflowMcpServer(service: WorkflowService): McpServer {
@@ -59,15 +66,38 @@ export function createWorkflowMcpServer(service: WorkflowService): McpServer {
     },
   );
 
-  return server;
-}
-
-function defaultStateDir(): string {
-  const stateHome =
-    process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-  return resolve(
-    process.env.AGENT_WORKFLOW_STATE_DIR ?? join(stateHome, "agent-workflow"),
+  server.registerTool(
+    "workflow.recovery_decision",
+    {
+      title: "Record workflow recovery decision",
+      description:
+        "Record the user's explicit approval or denial of a semantically different recovery after a cyber_policy failure. This tool never retries or changes the failed workflow.",
+      inputSchema: recoveryDecisionInputSchema,
+      outputSchema: recoveryDecisionOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (input) => {
+      const result = await service.recordRecoveryDecision(input);
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Recovery decision ${result.decision} recorded for ` +
+              `${result.workflow_id}.`,
+          },
+        ],
+        structuredContent: result,
+      };
+    },
   );
+
+  return server;
 }
 
 async function main(): Promise<void> {

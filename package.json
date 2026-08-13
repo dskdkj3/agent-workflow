@@ -7,6 +7,7 @@
     "node": ">=24"
   },
   "bin": {
+    "agent-workflow": "dist/cli.js",
     "agent-workflow-mcp": "dist/server.js"
   },
   "scripts": {

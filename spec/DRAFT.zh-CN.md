@@ -40,6 +40,8 @@
 
 **INT-004** 不需要 Workspace 执行或持久状态的请求可以直接回答，不必创建 Workflow Run。
 
+**INT-005** 当 Terminal Outcome 声明恢复需要用户批准时，交互式实现必须在改变请求语义、拆分或改写请求、切换执行路线或创建替代 Workflow Run 前取得用户明确批准。批准或拒绝必须作为原 Workflow Run 的 Recovery Decision 保留；不得把沉默视为批准。
+
 ## 4. 接受任务
 
 **RUN-001** 实现必须在修改 Workspace 或启动有副作用的执行前，形成并持久保存 Task Request。
@@ -69,6 +71,8 @@
 **JRN-004** 实现被中断后，必须能够从最后一个完整 Checkpoint 恢复；如果无法恢复，必须明确报告失败及不可恢复范围。
 
 **JRN-005** Checkpoint 的存储格式、文件布局和持久化技术属于实现定义。
+
+**JRN-006** 实现把 Workflow Run 的推进权转交给新的执行世代后，旧执行世代不得再写入权威生命周期事实、Checkpoint 或 Terminal Outcome。旧执行的晚到结果可以作为非权威证据保留，但不得推进 Workflow Run。
 
 ## 7. 证据与验证
 
@@ -102,7 +106,19 @@ Terminal Outcome 必须属于以下一种：
 
 **OUT-004** 实现可以在 Terminal Outcome 产生前发送 Progress Update，但必须明确表示任务仍未完成，不得把它描述或展示为暂定的 `completed`。
 
-## 9. 实现必须公开说明的内容
+## 9. Workflow Trace 与资源口径
+
+**TRC-001** 实现必须为每个 Workflow Run 提供一份只读 Workflow Trace。它必须足以说明执行路线、当前或最终状态、开始与结束时间、内部执行单元的父子关系（如存在）、Checkpoint、失败与恢复决定，以及 Task、Result 和 Evidence Reference 的位置。
+
+**TRC-002** 实现提供多个 Trace 展示方式时，这些展示必须消费同一份权威读模型，不得各自解释原始日志或持久化格式。
+
+**TRC-003** Trace 中的模型、推理档位、加速状态和资源消耗必须区分“请求值”与“实际值”。未观测到的实际值必须表示为 `unknown`，不得用请求值替代。
+
+**TRC-004** 资源统计必须声明其可信度，至少区分 `measured`、`estimated`、`partial` 和 `unknown`。缺失数据不得表示为零，也不得冒充精确账单或精确等价额度。
+
+**TRC-005** Journal 是可编辑的工作叙述，不是 Workflow Trace，也不是权威生命周期事实源。实现不得仅依据 Journal 中的完成声明产生 `completed`。
+
+## 10. 实现必须公开说明的内容
 
 合规实现必须公开说明：
 
@@ -113,14 +129,15 @@ Terminal Outcome 必须属于以下一种：
 - Verification 方法和失败语义；
 - 中断、恢复和取消能力；
 - 资源使用统计是否可用，以及统计口径。
+- Workflow Trace 的读取方式，以及哪些字段可能为 `estimated`、`partial` 或 `unknown`。
 
-## 10. 合规性
+## 11. 合规性
 
 实现只有在通过对应 Specification 版本的 conformance tests 后，才能声明合规。测试验证外部行为，不要求实现使用特定模型、Agent 拓扑、传输协议或存储技术。
 
 当前仓库中的 Codex + MCP 程序在 conformance suite 建立并通过前，只称为“候选参考实现”。
 
-## 11. 已解决的取舍（非规范说明）
+## 12. 已解决的取舍（非规范说明）
 
 Verification 不必阻塞实现内部继续推进，但必须阻塞最终 `completed`。实现可以发送明确的非终态进度；不得先向用户交付“暂定完成”，再要求用户等待第二次确认或纠正。
 
@@ -134,8 +151,9 @@ Verification 不必阻塞实现内部继续推进，但必须阻塞最终 `compl
 - 当前实现会在执行前保存任务并分配 Workflow ID，已经满足 RUN-001 与 RUN-003 的基本方向。
 - 当前 Controller 已把语义边界提交到独立于 Workspace 的本地 Git，并拒绝静默改写已提交的 `task.md` / `result.md`；已实现 `PreCompact` Journal Checkpoint、compact 后完整 Task/Journal 重载，以及用相同 `workflow_id` 和持久 Codex thread 从 Controller 进程中断后继续。
 - 当前候选实现已有显式 `single_worker` fast path；Worker 请求升级或独立 Verification 拒绝结果时，会返回可机读的 Orchestrator 重试建议，由 Interactive Implementation 自动重试。Backend 尚不在同一个 Workflow Run 内续跑完整路线。
-- 当前 SQLite 状态层会原子写入 Terminal Outcome 与对应事件，并拒绝后续终态覆盖；竞争信号的完整 conformance 测试仍未建立。
-- 当前 `usage` 汇总每个 Agent thread 的最新累计 SDK usage snapshot；同一 thread 恢复后的新 snapshot 会替代旧 snapshot。`input_tokens` 因而包含多轮工具调用重复处理或命中缓存的上下文，不等于唯一上下文大小。
+- 当前状态层使用带单调 epoch 的执行租约阻止旧 Controller、晚到 Agent turn 和旧 compact hook 在接管后继续推进；若心跳晚于名义过期时间但尚未发生接管，同一 owner/epoch 可以续租，一旦新 Controller 递增 epoch，旧执行永久失去推进权；已有对抗测试覆盖这两种情况。
+- 当前 `usage` 汇总每个 Agent thread 的最新累计 SDK usage snapshot，并显式标注 `measured`、`partial` 或 `unknown`；同一 thread 恢复后的新 snapshot 会替代旧 snapshot。`input_tokens` 因而包含多轮工具调用重复处理或命中缓存的上下文，不等于唯一上下文大小。
 - 当前完成路径使用 fresh-context Verification，但尚未形成与实现无关的合规测试。
-- 当前 Terminal Outcome 没有 `cancelled`。
+- 当前 Terminal Outcome 支持 `cancelled`，并把 `cyber_policy` 标记为必须由用户明确批准语义不同的恢复。
+- 当前提供一份 Workflow Trace 读模型，以及共同消费它的文本、JSON、follow 和 loopback Web 视图；实际 Fast 与等价额度在无法观测时保持 `unknown`。
 - 当前没有 Specification 版本声明、implementation-defined choices 清单或 conformance suite。

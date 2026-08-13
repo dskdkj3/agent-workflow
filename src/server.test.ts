@@ -33,6 +33,9 @@ function workflowOutput(
     blocker: null,
     execution_route: "orchestrated",
     retry_route: null,
+    usage_status: "measured",
+    failure_kind: null,
+    recovery_requires_user_approval: false,
     usage: {
       input_tokens: 1,
       cached_input_tokens: 0,
@@ -115,9 +118,18 @@ test("workflow.run exposes and returns validated structured output", async (t) =
           summary: "Synthetic failure",
           result_path: null,
           blocker: "Synthetic failure",
+          failure_kind: "execution_error",
         });
       }
       return workflowOutput();
+    },
+    recordRecoveryDecision(input) {
+      return {
+        workflow_id: input.workflow_id,
+        decision_id: input.decision_id,
+        decision: input.decision,
+        recorded_at: "2026-08-12T00:00:00.000Z",
+      };
     },
   };
   const server = createWorkflowMcpServer(service);
@@ -139,6 +151,12 @@ test("workflow.run exposes and returns validated structured output", async (t) =
   assert.ok(tool.outputSchema);
   assert.equal(tool.annotations?.readOnlyHint, false);
   assert.equal(tool.annotations?.idempotentHint, false);
+
+  const recoveryTool = listed.tools.find(
+    (candidate) => candidate.name === "workflow.recovery_decision",
+  );
+  assert.ok(recoveryTool);
+  assert.equal(recoveryTool.annotations?.idempotentHint, true);
 
   const result = await client.callTool({
     name: "workflow.run",
@@ -176,8 +194,25 @@ test("workflow.run exposes and returns validated structured output", async (t) =
       summary: "Synthetic failure",
       result_path: null,
       blocker: "Synthetic failure",
+      failure_kind: "execution_error",
     }),
   );
+
+  const recovery = await client.callTool({
+    name: "workflow.recovery_decision",
+    arguments: {
+      workflow_id: "00000000-0000-4000-8000-000000000001",
+      decision_id: "00000000-0000-4000-8000-000000000002",
+      decision: "approved",
+    },
+  });
+  assert.notEqual(recovery.isError, true);
+  assert.deepEqual(recovery.structuredContent, {
+    workflow_id: "00000000-0000-4000-8000-000000000001",
+    decision_id: "00000000-0000-4000-8000-000000000002",
+    decision: "approved",
+    recorded_at: "2026-08-12T00:00:00.000Z",
+  });
 });
 
 testStdioProtocol("2025-06-18", "Legacy");

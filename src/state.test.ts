@@ -6,7 +6,48 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { emptyUsage, type WorkflowRunOutput } from "./contracts.js";
-import { StateStore } from "./state.js";
+import { StateStore, WorkflowLeaseLostError } from "./state.js";
+
+test("an expired owner can renew only until another Controller takes over", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "agent-workflow-lease-renewal-"));
+  const store = new StateStore(join(root, "controller.sqlite3"));
+  t.after(() => {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const workflowId = "00000000-0000-4000-8000-000000000010";
+  store.createWorkflow(
+    workflowId,
+    "Exercise lease renewal",
+    "/tmp/workspace",
+    "/tmp/task",
+    "orchestrated",
+    [],
+    emptyUsage(),
+  );
+  const first = store.claimWorkflow(workflowId, "owner-a", 60_000);
+  assert.ok(first);
+  store.database
+    .prepare("UPDATE workflows SET lease_expires_at = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", workflowId);
+
+  assert.equal(store.heartbeatWorkflow(first, 60_000), true);
+  store.assertWorkflowLease(first);
+
+  store.database
+    .prepare("UPDATE workflows SET lease_expires_at = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", workflowId);
+  const second = store.claimWorkflow(workflowId, "owner-b", 60_000);
+  assert.ok(second);
+  assert.equal(second.epoch, first.epoch + 1);
+  assert.equal(store.heartbeatWorkflow(first, 60_000), false);
+  assert.throws(
+    () => store.assertWorkflowLease(first),
+    WorkflowLeaseLostError,
+  );
+  store.assertWorkflowLease(second);
+});
 
 test("migrates legacy agent runs to the historical sol_high profile", (t) => {
   const root = mkdtempSync(join(tmpdir(), "agent-workflow-state-"));
@@ -109,6 +150,8 @@ test("stores exactly one terminal outcome and matching terminal event", (t) => {
     [],
     usage,
   );
+  const lease = store.claimWorkflow(workflowId, "terminal-test", 60_000);
+  assert.ok(lease);
   const completed: WorkflowRunOutput = {
     workflow_id: workflowId,
     status: "completed",
@@ -118,20 +161,24 @@ test("stores exactly one terminal outcome and matching terminal event", (t) => {
     questions: [],
     blocker: null,
     usage,
+    usage_status: "measured",
     execution_route: "orchestrated",
     retry_route: null,
+    failure_kind: null,
+    recovery_requires_user_approval: false,
   };
-  store.finishWorkflow(completed);
+  store.finishWorkflow(lease, completed);
 
   const competingFailure: WorkflowRunOutput = {
     ...completed,
     status: "failed",
     summary: "A late failure tried to replace completion",
     blocker: "late failure",
+    failure_kind: "execution_error",
   };
   assert.throws(
-    () => store.finishWorkflow(competingFailure),
-    /already has terminal outcome completed/,
+    () => store.finishWorkflow(lease, competingFailure),
+    /Controller lease was lost/,
   );
   assert.equal(store.getWorkflow(workflowId)?.status, "completed");
 
