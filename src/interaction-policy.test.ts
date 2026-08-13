@@ -11,8 +11,13 @@ const policy = readFileSync(
 );
 
 test("Interaction policy uses Codex Code Mode callable tool names", () => {
-  assert.match(policy, /await tools\.workflow_run\(/);
-  assert.match(policy, /await tools\.workflow_recovery_decision\(/);
+  assert.match(policy, /await tools\.mcp__agent_workflow__workflow_run\(/);
+  assert.match(
+    policy,
+    /await tools\.mcp__agent_workflow__workflow_recovery_decision\(/,
+  );
+  assert.doesNotMatch(policy, /await tools\.workflow_run\(/);
+  assert.doesNotMatch(policy, /await tools\.workflow_recovery_decision\(/);
   assert.match(policy, /workflow\.run/);
   assert.match(policy, /workflow\.recovery_decision/);
 });
