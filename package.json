@@ -19,11 +19,13 @@
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
     "@openai/codex-sdk": "0.147.0",
+    "ws": "8.21.3",
     "zod": "4.2.0"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.0.0",
     "@types/node": "24.13.3",
+    "@types/ws": "8.18.1",
     "typescript": "7.0.2"
   }
 }

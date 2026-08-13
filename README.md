@@ -26,6 +26,9 @@ Interaction Agent
 - an interrupted Controller invocation can resume the original Workflow Run by reusing its caller-generated `workflow_id`
 - monotonic lease epochs fence superseded Controllers, late Agent turns, and stale lifecycle hooks
 - one authoritative Workflow Trace powers text, JSON, follow, and loopback-only Web views
+- when the caller exposes the same Codex app-server Unix socket and supplies its
+  thread ID in MCP request metadata, the server best-effort names that thread
+  `Workflow <workflow-id> · <status>` for statusline display
 - no MCP Tasks, MRTR, scheduler, general retry engine, or persistent routing learner
 - standalone Nix package for the internal `agent-workflow-mcp` server; host integration remains external
 
@@ -129,6 +132,10 @@ that registration name so child Agents cannot recursively invoke this workflow.
 Host integrations may pass provider-specific Codex settings through
 `AGENT_WORKFLOW_CODEX_CONFIG_JSON`; keep secrets out of that JSON and reference an
 inherited environment variable with the provider's `env_key` instead.
+When `CODEX_HOME/app-server-control/app-server-control.sock` exists and Codex adds
+`_meta.threadId` to the tool request, title updates use the app-server's
+`thread/name/set` RPC. A missing socket or failed title update is reported as a
+warning and never changes the Workflow outcome.
 
 Mutable task artifacts live under `tasks/<workflow-id>/`. Their version history
 lives separately under `checkpoints/<workflow-id>.git`; the Controller commits only

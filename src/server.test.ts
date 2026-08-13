@@ -13,8 +13,13 @@ import {
 
 import {
   workflowRunOutputSchema,
+  type WorkflowRunInput,
   type WorkflowRunOutput,
 } from "./contracts.js";
+import type {
+  WorkflowTitleReporter,
+  WorkflowTitleStatus,
+} from "./codex-app-server-title.js";
 import {
   createWorkflowMcpServer,
   type WorkflowService,
@@ -112,8 +117,10 @@ test("workflow.run exposes and returns validated structured output", async (t) =
   const service: WorkflowService = {
     async run(input) {
       calls.push(input);
+      assert.ok(input.workflow_id);
       if (input.request === "fail") {
         return workflowOutput({
+          workflow_id: input.workflow_id,
           status: "failed",
           summary: "Synthetic failure",
           result_path: null,
@@ -121,7 +128,7 @@ test("workflow.run exposes and returns validated structured output", async (t) =
           failure_kind: "execution_error",
         });
       }
-      return workflowOutput();
+      return workflowOutput({ workflow_id: input.workflow_id });
     },
     recordRecoveryDecision(input) {
       return {
@@ -166,15 +173,15 @@ test("workflow.run exposes and returns validated structured output", async (t) =
     },
   });
   assert.equal(result.isError, false);
-  assert.deepEqual(result.structuredContent, workflowOutput());
-  assert.deepEqual(calls, [
-    {
-      request: "run fixture",
-      workspace: "/tmp/workspace",
-      execution_route: "orchestrated",
-      completion_criteria: [],
-    },
-  ]);
+  const completed = workflowRunOutputSchema.parse(result.structuredContent);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    request: "run fixture",
+    workspace: "/tmp/workspace",
+    execution_route: "orchestrated",
+    completion_criteria: [],
+    workflow_id: completed.workflow_id,
+  });
   assert.ok(
     result.content.some(
       (block) =>
@@ -187,9 +194,12 @@ test("workflow.run exposes and returns validated structured output", async (t) =
     arguments: { request: "fail" },
   });
   assert.equal(failed.isError, true);
+  const failedInput = calls[1] as WorkflowRunInput | undefined;
+  assert.ok(failedInput?.workflow_id);
   assert.deepEqual(
     failed.structuredContent,
     workflowOutput({
+      workflow_id: failedInput.workflow_id,
       status: "failed",
       summary: "Synthetic failure",
       result_path: null,
@@ -213,6 +223,128 @@ test("workflow.run exposes and returns validated structured output", async (t) =
     decision: "approved",
     recorded_at: "2026-08-12T00:00:00.000Z",
   });
+});
+
+test("workflow.run reports the caller thread Workflow ID and terminal status", async (t) => {
+  const titles: Array<{
+    threadId: string;
+    workflowId: string;
+    status: WorkflowTitleStatus;
+  }> = [];
+  const seenInputs: WorkflowRunInput[] = [];
+  const titleReporter: WorkflowTitleReporter = {
+    async setWorkflowStatus(threadId, workflowId, status) {
+      titles.push({ threadId, workflowId, status });
+    },
+  };
+  const service: WorkflowService = {
+    async run(input) {
+      seenInputs.push(input);
+      assert.ok(input.workflow_id);
+      return workflowOutput({ workflow_id: input.workflow_id });
+    },
+    recordRecoveryDecision(input) {
+      return {
+        workflow_id: input.workflow_id,
+        decision_id: input.decision_id,
+        decision: input.decision,
+        recorded_at: "2026-08-13T00:00:00.000Z",
+      };
+    },
+  };
+  const server = createWorkflowMcpServer(service, { titleReporter });
+  const client = new Client({
+    name: "agent-workflow-title-test",
+    version: "0.1.0",
+  });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const result = await client.callTool({
+    name: "workflow.run",
+    arguments: { request: "run title fixture" },
+    _meta: { threadId: "thread-123" },
+  });
+  const structured = workflowRunOutputSchema.parse(result.structuredContent);
+
+  assert.equal(seenInputs.length, 1);
+  assert.equal(seenInputs[0]?.workflow_id, structured.workflow_id);
+  assert.deepEqual(titles, [
+    {
+      threadId: "thread-123",
+      workflowId: structured.workflow_id,
+      status: "running",
+    },
+    {
+      threadId: "thread-123",
+      workflowId: structured.workflow_id,
+      status: "completed",
+    },
+  ]);
+});
+
+test("Workflow title failures warn without changing the Workflow outcome", async (t) => {
+  const warnings: string[] = [];
+  const service: WorkflowService = {
+    async run(input) {
+      assert.ok(input.workflow_id);
+      return workflowOutput({ workflow_id: input.workflow_id });
+    },
+    recordRecoveryDecision(input) {
+      return {
+        workflow_id: input.workflow_id,
+        decision_id: input.decision_id,
+        decision: input.decision,
+        recorded_at: "2026-08-13T00:00:00.000Z",
+      };
+    },
+  };
+  const server = createWorkflowMcpServer(service, {
+    titleReporter: {
+      async setWorkflowStatus() {
+        throw new Error("synthetic title failure");
+      },
+    },
+    warn(message) {
+      warnings.push(message);
+    },
+  });
+  const client = new Client({
+    name: "agent-workflow-title-warning-test",
+    version: "0.1.0",
+  });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const result = await client.callTool({
+    name: "workflow.run",
+    arguments: { request: "run despite title failure" },
+    _meta: { threadId: "thread-123" },
+  });
+
+  assert.equal(result.isError, false);
+  assert.equal(
+    workflowRunOutputSchema.parse(result.structuredContent).status,
+    "completed",
+  );
+  assert.equal(warnings.length, 2);
+  assert.ok(
+    warnings.every((warning) => warning.includes("synthetic title failure")),
+  );
 });
 
 testStdioProtocol("2025-06-18", "Legacy");
