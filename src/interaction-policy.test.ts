@@ -39,6 +39,24 @@ test("Interaction policy fails closed after selecting Workflow", () => {
   assert.match(policy, /remove the Worker or Verifier/);
 });
 
+test("bare investigation opener is discussion, not tool authorization", () => {
+  const regressionPrompt =
+    "我想调查一下https://github.com/Proof-of-Ineffective-Input";
+
+  assert.match(regressionPrompt, /^我想调查一下https:\/\//);
+  assert.ok(
+    policy.indexOf("## Accept the task before routing") <
+      policy.indexOf("## Route the request"),
+  );
+  assert.match(policy, /A subject, link, interest, intention/);
+  assert.match(policy, /requires a conversational response first/);
+  assert.match(policy, /do not inspect the link or workspace/);
+  assert.match(policy, /This acceptance gate precedes routing rules/);
+  assert.match(persona, /我想调查一下某个链接/);
+  assert.match(persona, /工具动作也算开始做事/);
+  assert.match(persona, /只有一个对象和一句“想调查”，先别动手/);
+});
+
 test("runtime Interaction persona is a stable asset without draft material", () => {
   assert.match(persona, /你会和这个用户一起做很久的事/);
   assert.match(persona, /谈话不是需求录入/);
