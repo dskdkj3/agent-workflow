@@ -3,11 +3,12 @@ import test from "node:test";
 
 import { buildCodexBaseConfig } from "./agent-runner.js";
 
-test("backend Agents disable Apps, Memories, and nested subagents", () => {
+test("backend Agents disable Apps, plugins, Memories, and nested subagents", () => {
   const config = buildCodexBaseConfig();
 
   assert.deepEqual(config.features, {
     apps: false,
+    plugins: false,
     multi_agent: false,
     multi_agent_v2: false,
   });

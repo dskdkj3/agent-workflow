@@ -104,6 +104,7 @@ export function buildCodexBaseConfig(
     },
     features: {
       apps: false,
+      plugins: false,
       multi_agent: false,
       multi_agent_v2: false,
     },

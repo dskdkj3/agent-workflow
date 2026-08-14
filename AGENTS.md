@@ -10,7 +10,7 @@ This repository implements the standalone Workflow MCP described by the project 
 - Allowlisted model profiles are `luna_max`, `terra_high`, `sol_high`, and `sol_max`; preserve the real `max` effort through Codex config and never map it to `xhigh`.
 - Codex is behind an `AgentRunner` adapter. Do not couple Controller state or MCP schemas directly to Codex SDK internals.
 - Keep provider wiring outside the core; host integrations may inject generic Codex config through `AGENT_WORKFLOW_CODEX_CONFIG_JSON`.
-- Orchestrator, Worker, and Verifier must not use Codex Apps, use or generate Codex Memories, or create subagents.
+- Orchestrator, Worker, and Verifier must not use Codex Apps or plugins, use or generate Codex Memories, or create subagents.
 - The Verifier must start in a fresh thread, receive the original request plus artifact paths, and avoid the Worker journal unless resolving a specific contradiction.
 - Every Agent owns `task.md`, `journal.md`, and `result.md`; `task.md` and completed `result.md` are frozen. On the bounded fast path, the Controller may materialize the Agent's structured outcome into the final Journal and result instead of spending model turns on bookkeeping-only writes.
 - SQLite stores lifecycle state, route, events, and checkpoint commit IDs. Markdown artifacts store task narrative and handoff content; a separate local Git repository per workflow preserves semantic versions without touching the Workspace repository.
