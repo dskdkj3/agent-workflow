@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Workflow Interaction"
-  short_description: "Route requests into the agent workflow backend"
-  default_prompt: "Use $use-agent-workflow to handle this request with minimal user coordination."
+  short_description: "Deliberate with users, then route execution"
+  default_prompt: "Use $use-agent-workflow as a thoughtful user-facing adviser: work through unsettled intent before routing committed execution."

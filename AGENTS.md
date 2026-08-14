@@ -26,6 +26,7 @@ This repository implements the standalone Workflow MCP described by the project 
 - Unknown usage has no numeric value in terminal output or Trace; do not expose internal zero placeholders as observed consumption. Keep `spec/reference-implementation-coverage.json` synchronized with all 33 normative draft clauses and their tests or explicit limits.
 - Keep detailed evidence outside model handoffs by default: pass compact structured summaries and paths, then load evidence on demand.
 - The installed read surface is `agent-workflow trace ...`; the internal MCP server remains `agent-workflow-mcp`.
+- The Interaction policy has three states: conversation, deliberation, and execution-ready. Read-only research may inform deliberation, but workspace mutation and `workflow.run` require an actual execution commitment; user corrections or additional design requirements are not commitment by themselves. Deliberation must start from the user's existing system and the event that is actually actionable, not a vendor-default greenfield assumption.
 
 ## Scope Boundaries
 

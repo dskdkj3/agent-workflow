@@ -22,6 +22,7 @@ Interaction Agent
 - allowlisted model routes: `luna_high`, `luna_xhigh`, `luna_max`, `terra_high`, `sol_high`, `sol_max`
 - Orchestrator uses `sol_high`; it classifies residual Worker and Verifier task shape, then the Controller applies a fixed, auditable profile mapping
 - the explicit `single_worker` route uses `luna_high` for both the bounded Worker and mechanical independent Verifier
+- the Interaction policy distinguishes conversation, deliberation, and execution-ready states; read-only research may support deliberation, but only an execution-ready request may mutate a workspace or call `workflow.run`, and advice must be grounded in the user's existing system rather than a generic vendor path
 - backend Agents explicitly disable Codex Apps, Memories, and nested subagents
 - semantic Journal checkpoints are committed by the Controller to one local, non-project Git repository per workflow
 - an interrupted Controller invocation restores active Task and Journal content from the last authoritative complete Checkpoint before resuming the original Workflow Run

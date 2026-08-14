@@ -19,6 +19,16 @@ const persona = readFileSync(
   ),
   "utf8",
 );
+const interfaceMetadata = readFileSync(
+  join(
+    projectRoot,
+    "skills",
+    "use-agent-workflow",
+    "agents",
+    "openai.yaml",
+  ),
+  "utf8",
+);
 
 test("Interaction policy uses Codex Code Mode callable tool names", () => {
   assert.match(policy, /await tools\.mcp__agent_workflow__workflow_run\(/);
@@ -45,16 +55,80 @@ test("bare investigation opener is discussion, not tool authorization", () => {
 
   assert.match(regressionPrompt, /^我想调查一下https:\/\//);
   assert.ok(
-    policy.indexOf("## Accept the task before routing") <
+    policy.indexOf("## Establish the interaction state before routing") <
       policy.indexOf("## Route the request"),
   );
-  assert.match(policy, /A subject, link, interest, intention/);
-  assert.match(policy, /requires a conversational response first/);
-  assert.match(policy, /do not inspect the link or workspace/);
-  assert.match(policy, /This acceptance gate precedes routing rules/);
+  assert.match(policy, /subject, link, early thought, preference, or interest/);
+  assert.match(policy, /remains `conversation`/);
+  assert.match(policy, /do not inspect first/);
+  assert.match(policy, /state decision precedes route selection/);
   assert.match(persona, /我想调查一下某个链接/);
   assert.match(persona, /工具动作也算开始做事/);
   assert.match(persona, /只有一个对象和一句“想调查”，先别动手/);
+});
+
+test("Interaction keeps design deliberation distinct from execution commitment", () => {
+  const regressionPrompt =
+    "我想在codex-cli更新新版本的时候用我现成的bark提醒我";
+  const deliberationFollowup =
+    "改成一小时，状态持久化，同时看看 npm 和 GitHub，跑在 desktop";
+
+  assert.match(regressionPrompt, /我想在codex-cli更新新版本/);
+  assert.match(deliberationFollowup, /状态持久化/);
+  assert.ok(
+    policy.indexOf("## Establish the interaction state before routing") <
+      policy.indexOf("## Route the request"),
+  );
+  assert.match(policy, /`conversation`/);
+  assert.match(policy, /`deliberation`/);
+  assert.match(policy, /`execution_ready`/);
+  assert.match(policy, /Persistent automation, monitoring/);
+  assert.match(policy, /not execution authorization by themselves/);
+  assert.match(policy, /do not mutate the workspace or call `workflow\.run`/);
+  assert.match(policy, /general bias toward autonomous execution applies only after/);
+  assert.match(policy, /Do more than collect missing fields/);
+  assert.match(policy, /never treat your own confidence as user authorization/);
+  assert.match(persona, /一个愿望已经说清楚，也不等于已经到了执行/);
+  assert.match(persona, /不等于他说了“现在开始做”/);
+  assert.match(persona, /不要只把用户的话整理得更专业/);
+});
+
+test("Interaction grounds advice in the existing system and actionable event", () => {
+  assert.match(policy, /actual system, not a generic greenfield design/);
+  assert.match(policy, /real system of record/);
+  assert.match(policy, /current install or consumption path/);
+  assert.match(policy, /external event being observed/);
+  assert.match(policy, /point where it becomes consumable or actionable/);
+  assert.match(policy, /Multiple sources may corroborate one event/);
+  assert.match(policy, /a provisional problem model, a recommendation, an objection/);
+  assert.match(policy, /Questions should test or refine that contribution/);
+  assert.match(policy, /do not turn deliberation into an exhaustive audit/);
+  assert.match(persona, /“我现成的”“接进现在这套”“沿用已有的”/);
+  assert.match(persona, /官网最常见的安装方式/);
+  assert.match(persona, /上游发了版本、包源已经发布/);
+  assert.match(persona, /现在有没有什么值得我行动/);
+  assert.match(persona, /所谓一起 battle/);
+  assert.match(persona, /不只是任务说明越来越长/);
+});
+
+test("Interaction skill metadata invites deliberation rather than silent completion", () => {
+  assert.match(interfaceMetadata, /Deliberate with users, then route execution/);
+  assert.match(interfaceMetadata, /thoughtful user-facing adviser/);
+  assert.match(interfaceMetadata, /work through unsettled intent/);
+  assert.doesNotMatch(interfaceMetadata, /minimal user coordination/);
+});
+
+test("Interaction state remains an internal control rather than user-facing narration", () => {
+  assert.match(policy, /Keep interaction-state labels and routing policy internal/);
+  assert.match(policy, /do not announce that the request "remains in deliberation"/);
+  assert.match(policy, /do not repeat it in the substantive answer/);
+  assert.match(persona, /别把脑子里的状态机念出来/);
+  assert.match(persona, /我还没改，刚才只是在把方案想清楚/);
+});
+
+test("single-Worker Interaction guidance uses the bounded Luna High route", () => {
+  assert.match(policy, /one Luna High Worker and a fresh Luna High Verifier/);
+  assert.doesNotMatch(policy, /one Luna Max Worker and a fresh Luna Max Verifier/);
 });
 
 test("runtime Interaction persona is a stable asset without draft material", () => {
