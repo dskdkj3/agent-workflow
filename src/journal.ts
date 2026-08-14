@@ -12,12 +12,12 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 
 import type {
-  AgentOutcome,
   AgentRole,
+  VerificationEvidenceReference,
   VerificationOutcome,
 } from "./contracts.js";
 
@@ -43,6 +43,14 @@ interface JournalOutcome {
   questions: string[];
   blocker: string | null;
 }
+
+interface ResultMaterializationOptions {
+  preserveExisting?: boolean;
+  acceptFinalized?: boolean;
+  evidenceReferences?: VerificationEvidenceReference[];
+}
+
+const CONTROLLER_RESULT_MARKER = "agent-workflow-controller-result:v1";
 
 function markdownList(items: string[]): string {
   return items.length === 0 ? "- None specified" : items.map((item) => `- ${item}`).join("\n");
@@ -125,6 +133,54 @@ function replaceRegularFile(
   }
 }
 
+function resultSignature(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function existingAgentReport(
+  path: string,
+  expectedSignature: string,
+  preserveExisting: boolean,
+  acceptFinalized: boolean,
+): { finalized: boolean; report: string | null } {
+  if (!pathEntryExists(path)) {
+    return { finalized: false, report: null };
+  }
+  if (!preserveExisting) {
+    return { finalized: false, report: null };
+  }
+
+  const content = readRegularFile(path);
+  const marker = content.match(
+    /<!-- agent-workflow-controller-result:v1:([0-9a-f]{64}) -->/,
+  );
+  if (marker !== null && acceptFinalized) {
+    if (marker[1] !== expectedSignature) {
+      throw new Error(`Final result differs from its structured outcome: ${path}`);
+    }
+    return { finalized: true, report: null };
+  }
+  const report = content.trim();
+  return { finalized: false, report: report === "" ? null : report };
+}
+
+function evidenceList(references: VerificationEvidenceReference[]): string {
+  return references.length === 0
+    ? "- None"
+    : references
+        .map(
+          (reference) =>
+            `- ${reference.claim}\n  - Artifact: \`${reference.artifact_path}\``,
+        )
+        .join("\n");
+}
+
+function agentReportSection(report: string | null): string {
+  return report === null
+    ? ""
+    : `\n\n## Agent-authored report\n\n${report}\n`;
+}
+
 const INITIAL_JOURNAL_STATUS =
   "Current status: task created; execution has not started.";
 
@@ -175,6 +231,26 @@ export function createAgentJournal(
   return paths;
 }
 
+export function restoreAgentJournal(
+  paths: AgentJournalPaths,
+  task: string,
+  journal: string,
+): void {
+  replaceRegularFile(paths.task, task, 0o444);
+  replaceRegularFile(paths.journal, journal, 0o600);
+}
+
+export function prepareResultForTurn(path: string): void {
+  if (!pathEntryExists(path)) {
+    return;
+  }
+  const entry = lstatSync(path);
+  if (entry.isDirectory()) {
+    throw new Error(`Result artifact is a directory: ${path}`);
+  }
+  unlinkSync(path);
+}
+
 export function ensureStructuredJournal(
   path: string,
   outcome: JournalOutcome,
@@ -209,16 +285,31 @@ export function ensureResult(
   path: string,
   role: AgentRole,
   outcome: JournalOutcome,
+  options: ResultMaterializationOptions = {},
 ): void {
+  const evidenceReferences = options.evidenceReferences ?? [];
+  const signature = resultSignature({ role, outcome, evidenceReferences });
+  const existing = existingAgentReport(
+    path,
+    signature,
+    options.preserveExisting === true,
+    options.acceptFinalized === true,
+  );
+  if (existing.finalized) {
+    return;
+  }
   const questions = markdownList(outcome.questions);
   replaceRegularFile(
     path,
-    `# Result\n\n` +
+    `<!-- ${CONTROLLER_RESULT_MARKER}:${signature} -->\n` +
+      `# Result\n\n` +
       `- Role: \`${role}\`\n` +
       `- Status: \`${outcome.status}\`\n\n` +
       `## Summary\n\n${outcome.summary}\n\n` +
       `## Questions\n\n${questions}\n\n` +
-      `## Blocker\n\n${outcome.blocker ?? "None"}\n`,
+      `## Blocker\n\n${outcome.blocker ?? "None"}\n\n` +
+      `## Evidence references\n\n${evidenceList(evidenceReferences)}\n` +
+      agentReportSection(existing.report),
     0o444,
   );
 }
@@ -247,7 +338,18 @@ export function ensureFrozenVerificationResult(
 export function ensureVerificationResult(
   path: string,
   outcome: VerificationOutcome,
+  options: ResultMaterializationOptions = {},
 ): void {
+  const signature = resultSignature({ role: "verifier", outcome });
+  const existing = existingAgentReport(
+    path,
+    signature,
+    options.preserveExisting === true,
+    options.acceptFinalized === true,
+  );
+  if (existing.finalized) {
+    return;
+  }
   const findings =
     outcome.findings.length === 0
       ? "- None"
@@ -259,13 +361,16 @@ export function ensureVerificationResult(
           .join("\n");
   replaceRegularFile(
     path,
-    `# Result\n\n` +
+    `<!-- ${CONTROLLER_RESULT_MARKER}:${signature} -->\n` +
+      `# Result\n\n` +
       `- Role: \`verifier\`\n` +
       `- Status: \`${outcome.status}\`\n\n` +
       `## Summary\n\n${outcome.summary}\n\n` +
       `## Findings\n\n${findings}\n\n` +
+      `## Evidence references\n\n${evidenceList(outcome.evidence_references)}\n\n` +
       `## Questions\n\n${markdownList(outcome.questions)}\n\n` +
-      `## Blocker\n\n${outcome.blocker ?? "None"}\n`,
+      `## Blocker\n\n${outcome.blocker ?? "None"}\n` +
+      agentReportSection(existing.report),
     0o444,
   );
 }

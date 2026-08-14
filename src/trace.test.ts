@@ -122,7 +122,32 @@ function createTraceFixture(): {
     orchestratorUsage,
     "measured",
     "orchestrator.planned",
-    { outcome: { status: "ready" } },
+    {
+      outcome: {
+        status: "ready",
+        summary: "A long bounded Worker can execute the fixture",
+        worker_task: "Create the expected output",
+        worker_route: {
+          task_class: "long_horizon_execution",
+          residual_burden: "The fixture needs iterative bounded execution",
+          why_lower_cost_route_is_insufficient:
+            "The short route does not allow enough iteration",
+          upgrade_trigger: "Escalate if the completion oracle becomes ambiguous",
+        },
+        verifier_route: {
+          task_class: "bounded_evidence_review",
+          residual_burden: "The output needs independent evidence review",
+          why_lower_cost_route_is_insufficient:
+            "One mechanical assertion does not cover the fixture",
+          upgrade_trigger: "Escalate if review becomes system-defining",
+        },
+        worker_profile: "luna_max",
+        verifier_profile: "terra_high",
+        completion_criteria: ["The expected output exists"],
+        questions: [],
+        blocker: null,
+      },
+    },
   );
   store.recordCheckpoint(
     lease,
@@ -283,7 +308,17 @@ test("projects one authoritative Workflow Trace with provenance", (t) => {
     ],
   );
   assert.equal(trace.agents[0]?.fast.effective_fast, null);
+  assert.equal(trace.agents[0]?.routing.source, "fixed");
+  assert.equal(trace.agents[0]?.routing.task_class, "orchestration");
   assert.equal(trace.agents[0]?.children[0]?.fast.effective_fast, true);
+  assert.equal(
+    trace.agents[0]?.children[0]?.routing.task_class,
+    "long_horizon_execution",
+  );
+  assert.equal(
+    trace.agents[0]?.children[1]?.routing.task_class,
+    "bounded_evidence_review",
+  );
   assert.equal(trace.checkpoints.length, 3);
   assert.equal(trace.evidence[0]?.artifact_path, fixture.evidencePath);
   assert.equal(
@@ -294,6 +329,7 @@ test("projects one authoritative Workflow Trace with provenance", (t) => {
   );
   const formatted = formatWorkflowTrace(trace);
   assert.match(formatted, /gpt-5\.6-luna; effort: max/);
+  assert.match(formatted, /routing: orchestrator; class: long_horizon_execution/);
   assert.match(formatted, /effective=unknown/);
   assert.match(formatted, /Quota equivalent: unknown/);
   assert.match(formatted, /The expected output is absent/);
@@ -324,6 +360,10 @@ test("CLI text and JSON consume the same Workflow Trace projection", (t) => {
   assert.equal(json.workflow.id, fixture.workflowId);
   assert.equal(json.workflow.fast.effective, null);
   assert.equal(json.workflow.quota_equivalent.status, "unknown");
+  assert.equal(
+    json.agents[0]?.children[0]?.routing.task_class,
+    "long_horizon_execution",
+  );
   assert.match(text, new RegExp(fixture.workflowId));
   assert.match(text, /gpt-5\.6-luna/);
   assert.match(text, /Usage: measured/);
@@ -459,17 +499,25 @@ test("loads a legacy Workflow Trace without migrating its read-only database", (
 
   assert.equal(trace.workflow.id, workflowId);
   assert.equal(trace.workflow.usage.status, "unknown");
+  assert.equal(trace.workflow.usage.value, null);
   assert.equal(trace.workflow.usage.source, null);
   assert.equal(trace.workflow.failure_kind, null);
   assert.equal(trace.workflow.recovery_requires_user_approval, false);
   assert.equal(trace.agents[0]?.profile, "luna_max");
   assert.equal(trace.agents[0]?.model, "gpt-5.6-luna");
   assert.equal(trace.agents[0]?.reasoning_effort, "max");
+  assert.equal(trace.agents[0]?.routing.source, "legacy_unknown");
+  assert.equal(trace.agents[0]?.routing.task_class, null);
   assert.equal(trace.agents[0]?.fast.requested_service_tier, "default");
   assert.equal(trace.agents[0]?.fast.effective_service_tier, null);
   assert.equal(trace.agents[0]?.usage.status, "unknown");
+  assert.equal(trace.agents[0]?.usage.value, null);
   assert.equal(trace.agents[0]?.usage.source, null);
   assert.equal(trace.agents[0]?.error_kind, null);
+  const formatted = formatWorkflowTrace(trace);
+  assert.match(formatted, /Usage: unknown/);
+  assert.doesNotMatch(formatted, /input=0/);
+  assert.doesNotMatch(JSON.stringify(trace), /"input_tokens":0/);
   assert.deepEqual(columns("workflows"), workflowColumnsBefore);
   assert.deepEqual(columns("agent_runs"), agentRunColumnsBefore);
   assert.deepEqual(readFileSync(databasePath), databaseBefore);
@@ -493,9 +541,16 @@ test("read-only Web viewer stays on loopback and does not follow artifact symlin
   const projected = (await api.json()) as ReturnType<typeof loadWorkflowTrace>;
   assert.equal(projected.workflow.id, fixture.workflowId);
   assert.equal(projected.revision, trace.revision);
+  assert.equal(
+    projected.agents[0]?.children[0]?.routing.task_class,
+    "long_horizon_execution",
+  );
   const page = await fetch(viewer.url);
   assert.equal(page.status, 200);
-  assert.match(await page.text(), /Workflow Trace/);
+  const pageText = await page.text();
+  assert.match(pageText, /Workflow Trace/);
+  assert.match(pageText, /Lower-cost rejection/);
+  assert.match(pageText, /item\.value == null \? 'unknown'/);
   assert.equal(await requestWithHost(viewer.url, "evil.example"), 421);
 
   const artifactIndex = trace.artifacts.findIndex(

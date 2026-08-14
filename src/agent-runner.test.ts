@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildCodexBaseConfig } from "./agent-runner.js";
+import { buildCodexBaseConfig, CodexAgentRunner } from "./agent-runner.js";
 
 test("backend Agents disable Apps, plugins, Memories, and nested subagents", () => {
   const config = buildCodexBaseConfig();
@@ -36,5 +36,15 @@ test("disabled Workflow MCP keeps a valid inert stdio transport", () => {
       args: ["-e", "process.exit(0)"],
       enabled: false,
     },
+  });
+});
+
+test("Luna xhigh is preserved as a real Codex reasoning effort", () => {
+  const runner = new CodexAgentRunner();
+
+  assert.deepEqual(runner.configuration("luna_xhigh"), {
+    model: "gpt-5.6-luna",
+    reasoningEffort: "xhigh",
+    requestedServiceTier: "default",
   });
 });

@@ -13,6 +13,7 @@ import {
   type AgentRole,
   type AgentUsage,
   type ModelProfile,
+  type ReasoningEffort,
 } from "./contracts.js";
 
 export interface AgentTurnRequest<T> {
@@ -50,7 +51,7 @@ export interface AgentTurnResult<T> {
 
 export interface AgentRunConfiguration {
   model: string;
-  reasoningEffort: "high" | "max";
+  reasoningEffort: ReasoningEffort;
   requestedServiceTier: string;
 }
 

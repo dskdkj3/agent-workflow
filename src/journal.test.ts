@@ -39,3 +39,45 @@ test("replaces a result symlink without touching its external target", (t) => {
     "external content must remain unchanged\n",
   );
 });
+
+test("preserves an Agent report and rejects a different structured outcome", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "agent-workflow-journal-report-"));
+  const result = join(root, "result.md");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(
+    result,
+    "# Full report\n\nDECISIVE_EVIDENCE_REFERENCE remains durable.\n",
+    "utf8",
+  );
+
+  ensureResult(
+    result,
+    "worker",
+    {
+      status: "completed",
+      summary: "The requested work is complete",
+      questions: [],
+      blocker: null,
+    },
+    { preserveExisting: true },
+  );
+  const finalized = readFileSync(result, "utf8");
+  assert.match(finalized, /agent-workflow-controller-result:v1/);
+  assert.match(finalized, /DECISIVE_EVIDENCE_REFERENCE/);
+
+  assert.throws(
+    () =>
+      ensureResult(
+        result,
+        "worker",
+        {
+          status: "completed",
+          summary: "A contradictory replacement summary",
+          questions: [],
+          blocker: null,
+        },
+        { preserveExisting: true, acceptFinalized: true },
+      ),
+    /differs from its structured outcome/,
+  );
+});

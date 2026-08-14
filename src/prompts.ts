@@ -25,15 +25,29 @@ ${options.workspace}
 Normalized request from the Interaction Agent:
 ${options.request}
 
-Choose the Worker and Verifier profiles from these allowlisted routes:
-- luna_max: bounded, explicit, mechanically verifiable, and cheap to retry.
-- terra_high: clear objective with meaningful local judgment or only partial mechanical verification.
-- sol_high: substantial ambiguity, global architecture, user-intent interpretation, or cross-system attention.
-- sol_max: exceptional work where Sol high is unlikely to be sufficient and the decision cost justifies maximum reasoning.
+Classify the residual task shape. The Controller maps each class to a fixed model profile:
 
-Route based on the residual cognitive burden after you have clarified and bounded the Worker task, not on the superficial task label. A complex user request may produce a luna_max Worker task after good decomposition. Use at least terra_high for ordinary independent verification and sol_high when verification needs architectural, security, or direction judgment; luna_max is acceptable for tightly mechanical verification.
+Worker classes:
+- short_bounded -> Luna high: one narrow task, few steps, explicit feedback.
+- bounded_execution -> Luna xhigh: ordinary multi-step implementation with strong tests or another reliable oracle.
+- long_horizon_execution -> Luna max: difficult or long iterative execution that remains fully bounded and strongly verifiable.
+- bounded_judgment -> Terra high: the objective is clear, but research, evidence synthesis, or local judgment cannot be reduced to a mechanical oracle.
+- irreducible_synthesis -> Sol high: after real decomposition, one Worker must still reconcile multiple systems or competing constraints without a strong oracle.
+- critical_deliberation -> Sol max: a system-defining or high-consequence decision where Sol high is specifically unlikely to be sufficient.
 
-Return status "ready" with a precise worker_task, worker_profile, verifier_profile, and observable completion_criteria when one Worker can proceed. Completion criteria must describe properties of the requested result that can be inspected; do not include internal workflow steps, model choices, or claims about what the future Verifier will do. Return "needs_input" only when upstream information is genuinely required. Return "blocked" for an objective external blocker. For non-ready outcomes set both profiles to null. Return only the JSON required by the output schema.`;
+Verifier classes:
+- mechanical_check -> Luna high: targeted tests, diffs, files, or other explicit evidence decide completion.
+- bounded_evidence_review -> Terra high: ordinary independent review requires evidence judgment but not a new system-level decision.
+- irreducible_review -> Sol high: verification itself must redo inseparable architectural, adversarial, or cross-system reasoning.
+- critical_review -> Sol max: the verification judgment is system-defining or unusually consequential and Sol high is specifically insufficient.
+
+Choose the model family from ambiguity, breadth, knowledge, and judgment burden; choose reasoning effort from task horizon, feedback strength, and iteration depth. Use the lowest-cost sufficient class. The words "security", "architecture", "audit", "research", "privacy", or "cross-source" do not justify Sol by themselves. Neither a large repository nor a long task description is evidence of irreducible synthesis.
+
+Resolve request-level ambiguity yourself. If a material user choice remains, return "needs_input" instead of delegating unresolved intent to a Sol Worker. A precise repository audit with an explicit rubric is normally bounded_judgment, not irreducible_synthesis. A hard implementation with deterministic tests can be long_horizon_execution. A choice that establishes a durable protocol or permission boundary can be critical_deliberation when it cannot be reduced further.
+
+For each non-null worker_route and verifier_route, state the residual burden, why a lower-cost route is insufficient, and the concrete condition that would require escalation. The Verifier route is independent: do not mirror the Worker class merely because the original topic sounds important.
+
+Return status "ready" with a precise worker_task, worker_route, verifier_route, and observable completion_criteria when one Worker can proceed. Give the Worker only the executable scope, material constraints, relevant paths, and completion meaning; do not reproduce the whole conversation or inflate the task with background that the Worker does not need. Completion criteria must describe properties of the requested result that can be inspected; do not include internal workflow steps, model choices, or claims about what the future Verifier will do. Return "needs_input" only when upstream information is genuinely required. Return "blocked" for an objective external blocker. For non-ready outcomes set both routes to null. Return only the JSON required by the output schema.`;
 }
 
 interface WorkerPromptOptions {
@@ -117,11 +131,11 @@ ${options.workerJournal.result}
 
 Do not read the Worker journal or inherit its reasoning unless a specific contradiction cannot be resolved from the request, workspace, diff, tests, and result evidence. Independently inspect the current workspace and rerun targeted checks when useful.
 
-Check whether the original goal was actually achieved, whether validation was weakened or gamed, whether relevant security problems are visible, and whether the implementation ignored an obvious existing solution or duplicated repository capability. Apply only the checks relevant to this task. Every finding must cite concrete observable evidence; do not report stylistic preferences as failures.
+Check whether the original goal was actually achieved, whether validation was weakened or gamed, whether relevant security problems are visible, and whether the implementation ignored an obvious existing solution or duplicated repository capability. Apply only the checks relevant to this task. Every finding must cite concrete observable evidence; do not report stylistic preferences as failures. A "passed" result must include at least one evidence_references entry whose artifact_path is an existing regular file inside the Workspace or Workflow task directory. Cite the durable artifact that supports the completion claim; your own unsupported statement is not evidence.
 
 ${artifactInstructions}
 
-Return "passed" when no material finding remains, "findings" with evidence-backed issues, "needs_input" only when user information is genuinely required, or "blocked" for an objective blocker. Return only the JSON required by the output schema.`;
+Return "passed" only when no material finding remains and durable Evidence References support the completion criteria. Return "findings" with evidence-backed issues, "needs_input" only when user information is genuinely required, or "blocked" for an objective blocker. Return only the JSON required by the output schema.`;
 }
 
 interface FinalOrchestratorPromptOptions {

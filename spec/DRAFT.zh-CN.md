@@ -149,11 +149,13 @@ Verification 不必阻塞实现内部继续推进，但必须阻塞最终 `compl
 
 - 当前 `workflow.run` 已为 `single_worker` 单列 `completion_criteria`，但默认路线仍把约束与完成含义主要封装在自由文本 request 中，尚未形成完整、稳定的 Task Request 字段模型。
 - 当前实现会在执行前保存任务并分配 Workflow ID，已经满足 RUN-001 与 RUN-003 的基本方向。
-- 当前 Controller 已把语义边界提交到独立于 Workspace 的本地 Git，并拒绝静默改写已提交的 `task.md` / `result.md`；已实现 `PreCompact` Journal Checkpoint、compact 后完整 Task/Journal 重载，以及用相同 `workflow_id` 和持久 Codex thread 从 Controller 进程中断后继续。
+- 当前 Controller 已把语义边界提交到独立于 Workspace 的本地 Git，并拒绝静默改写已提交的 `task.md` / `result.md`。Agent 在本轮写出的长报告会保存在 Controller 签章的最终 result 中；中断遗留的未完成 result 会在恢复 turn 前丢弃，不会冒充新结果。
+- 当前实现已有 `PreCompact` Journal Checkpoint、compact 后完整 Task/Journal 重载，以及用相同 `workflow_id` 和持久 Codex thread 从 Controller 进程中断后继续。进程恢复前会从 SQLite 记录的最新完整 Checkpoint 还原活动 Agent 的 Task/Journal；没有可读完整 Checkpoint 时明确失败，不会重新创建空 Journal 后继续。
 - 当前候选实现已有显式 `single_worker` fast path；Worker 请求升级或独立 Verification 拒绝结果时，会返回可机读的 Orchestrator 重试建议，由 Interactive Implementation 自动重试。Backend 尚不在同一个 Workflow Run 内续跑完整路线。
-- 当前状态层使用带单调 epoch 的执行租约阻止旧 Controller、晚到 Agent turn 和旧 compact hook 在接管后继续推进；若心跳晚于名义过期时间但尚未发生接管，同一 owner/epoch 可以续租，一旦新 Controller 递增 epoch，旧执行永久失去推进权；已有对抗测试覆盖这两种情况。
-- 当前 `usage` 汇总每个 Agent thread 的最新累计 SDK usage snapshot，并显式标注 `measured`、`partial` 或 `unknown`；同一 thread 恢复后的新 snapshot 会替代旧 snapshot。`input_tokens` 因而包含多轮工具调用重复处理或命中缓存的上下文，不等于唯一上下文大小。
-- 当前完成路径使用 fresh-context Verification，但尚未形成与实现无关的合规测试。
+- 当前状态层使用带单调 epoch 的执行租约阻止旧 Controller、晚到 Agent turn 和旧 compact hook 在接管后继续推进；若心跳晚于名义过期时间但尚未发生接管，同一 owner/epoch 可以续租，一旦新 Controller 递增 epoch，旧执行永久失去推进权。Git 中可能保留 SQLite 登记前失权产生的孤儿 commit，但它不进入权威 Checkpoint 列表，恢复和 Trace 不消费它。
+- 当前完成路径使用 fresh-context Verification；`passed` 必须带至少一个位于 Workspace 或 Workflow task directory 内、指向现存 regular file 的 Evidence Reference。无证据或越界/不可读证据会在 Controller 门槛转成非 `completed`。
+- 当前 `usage` 汇总每个 Agent thread 的最新累计 SDK usage snapshot，并显式标注 `measured`、`partial` 或 `unknown`；同一 thread 恢复后的新 snapshot 会替代旧 snapshot。`unknown` 的公开 value 为 `null`，不会暴露内部零占位符。`input_tokens` 包含多轮工具调用重复处理或命中缓存的上下文，不等于唯一上下文大小。
 - 当前 Terminal Outcome 支持 `cancelled`，并把 `cyber_policy` 标记为必须由用户明确批准语义不同的恢复。
 - 当前提供一份 Workflow Trace 读模型，以及共同消费它的文本、JSON、follow 和 loopback Web 视图；实际 Fast 与等价额度在无法观测时保持 `unknown`。
-- 当前没有 Specification 版本声明、implementation-defined choices 清单或 conformance suite。
+- `reference-implementation-coverage.json` 已把全部 33 条规范条款映射到确定性测试、实现定义选择或明确的 partial / external / not implemented 限制；这不是与实现无关的 conformance suite，也不构成合规声明。
+- 当前仍没有正式 Specification 版本承诺；默认路线的结构化 Task Request、Interaction 层的完整外部验收和异步 Verification 仍未完成。

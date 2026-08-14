@@ -4,6 +4,7 @@ import type {
   TraceArtifact,
   TraceFastState,
   TraceMeasurement,
+  TraceRoutingDecision,
   WorkflowTrace,
 } from "./trace.js";
 
@@ -24,6 +25,9 @@ function duration(value: number | null): string {
 
 function usage(measurement: TraceMeasurement<AgentUsage>): string {
   const value = measurement.value;
+  if (value === null) {
+    return "unknown";
+  }
   return (
     `${measurement.status}; input=${value.input_tokens}; ` +
     `cached=${value.cached_input_tokens}; cache_write=` +
@@ -42,12 +46,31 @@ function fast(state: TraceFastState): string {
   );
 }
 
+function routing(state: TraceRoutingDecision): string[] {
+  const lines = [
+    `routing: ${state.source}; class: ${state.task_class ?? "unknown"}`,
+  ];
+  if (state.residual_burden !== null) {
+    lines.push(`routing burden: ${state.residual_burden}`);
+  }
+  if (state.why_lower_cost_route_is_insufficient !== null) {
+    lines.push(
+      `lower-cost rejection: ${state.why_lower_cost_route_is_insufficient}`,
+    );
+  }
+  if (state.upgrade_trigger !== null) {
+    lines.push(`upgrade trigger: ${state.upgrade_trigger}`);
+  }
+  return lines;
+}
+
 function formatAgent(agent: TraceAgent, depth: number): string[] {
   const indent = "  ".repeat(depth);
   const childIndent = "  ".repeat(depth + 1);
   const lines = [
     `${indent}- ${agent.role} ${agent.id} [${agent.status}]`,
     `${childIndent}model: ${agent.model}; effort: ${agent.reasoning_effort}; profile: ${agent.profile}`,
+    ...routing(agent.routing).map((line) => `${childIndent}${line}`),
     `${childIndent}duration: ${duration(agent.duration_ms)}; thread: ${agent.thread_id ?? "unknown"}`,
     `${childIndent}fast: ${fast(agent.fast)}`,
     `${childIndent}usage: ${usage(agent.usage)}`,

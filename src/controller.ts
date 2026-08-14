@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { lstatSync, mkdirSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 
 import type { AgentRunner, AgentTurnResult } from "./agent-runner.js";
@@ -16,6 +16,7 @@ import {
   modelProfiles,
   orchestrationPlanWireSchema,
   orchestrationPlanSchema,
+  storedOrchestrationPlanSchema,
   verificationOutcomeWireSchema,
   verificationOutcomeSchema,
   workflowRunInputSchema,
@@ -31,7 +32,9 @@ import {
   recoveryDecisionOutputSchema,
   type RecoveryDecisionInput,
   type RecoveryDecisionOutput,
+  type StoredOrchestrationPlan,
   type UsageStatus,
+  type VerificationEvidenceReference,
   type WorkflowFailureKind,
   type VerificationOutcome,
   type WorkflowRunInput,
@@ -44,6 +47,8 @@ import {
   ensureStructuredJournal,
   ensureVerificationResult,
   freezeResult,
+  prepareResultForTurn,
+  restoreAgentJournal,
   type AgentJournalPaths,
 } from "./journal.js";
 import {
@@ -119,8 +124,8 @@ interface TerminalOutcome {
 }
 
 const ORCHESTRATOR_PROFILE: ModelProfile = "sol_high";
-const FAST_WORKER_PROFILE: ModelProfile = "luna_max";
-const FAST_VERIFIER_PROFILE: ModelProfile = "luna_max";
+const FAST_WORKER_PROFILE: ModelProfile = "luna_high";
+const FAST_VERIFIER_PROFILE: ModelProfile = "luna_high";
 const DEFAULT_LEASE_MS = 30_000;
 const DEFAULT_BACKEND_SERVICE_TIER = "default";
 
@@ -189,6 +194,78 @@ function classifyFailure(message: string): WorkflowFailureKind {
     normalized.includes("chatgpt.com/cyber")
     ? "cyber_policy"
     : "execution_error";
+}
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const path = relative(resolve(root), resolve(candidate));
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+function validatedVerificationOutcome(
+  outcome: VerificationOutcome,
+  workspace: string,
+  taskDir: string,
+): VerificationOutcome {
+  if (outcome.status !== "passed") {
+    return outcome;
+  }
+
+  const valid: VerificationEvidenceReference[] = [];
+  const invalid: string[] = [];
+  if (outcome.evidence_references.length === 0) {
+    invalid.push("Verification returned passed without an Evidence Reference");
+  }
+  for (const reference of outcome.evidence_references) {
+    if (!isAbsolute(reference.artifact_path)) {
+      invalid.push(
+        `Evidence Reference for ${reference.claim} is not an absolute path: ${reference.artifact_path}`,
+      );
+      continue;
+    }
+    const artifactPath = resolve(reference.artifact_path);
+    if (
+      !pathIsWithin(workspace, artifactPath) &&
+      !pathIsWithin(taskDir, artifactPath)
+    ) {
+      invalid.push(
+        `Evidence Reference for ${reference.claim} is outside the Workspace and Workflow task directory: ${artifactPath}`,
+      );
+      continue;
+    }
+    try {
+      if (!lstatSync(artifactPath).isFile()) {
+        invalid.push(
+          `Evidence Reference for ${reference.claim} is not a regular file: ${artifactPath}`,
+        );
+        continue;
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      invalid.push(
+        `Evidence Reference for ${reference.claim} cannot be read: ${artifactPath} (${detail})`,
+      );
+      continue;
+    }
+    valid.push({ ...reference, artifact_path: artifactPath });
+  }
+
+  if (invalid.length === 0) {
+    return { ...outcome, evidence_references: valid };
+  }
+  return verificationOutcomeSchema.parse({
+    status: "findings",
+    summary:
+      "Independent verification did not provide durable evidence sufficient for completion.",
+    findings: invalid.map((issue) => ({
+      issue,
+      evidence:
+        "The Controller rejected the passed outcome at the Evidence Reference gate.",
+    })),
+    evidence_references: valid,
+    result_path: outcome.result_path,
+    questions: [],
+    blocker: null,
+  });
 }
 
 export class WorkflowController {
@@ -302,6 +379,9 @@ export class WorkflowController {
       }
 
       const repository = this.checkpointRepository(workflowId, taskDir);
+      if (!created) {
+        this.restoreResumableArtifacts(workflow, repository, lease);
+      }
       return input.execution_route === "single_worker"
         ? await this.runSingleWorker(
             workflow,
@@ -368,13 +448,13 @@ export class WorkflowController {
       repository,
       lease,
     );
-    let plan = this.completedOutcome<OrchestrationPlan>(
+    let plan = this.completedOutcome<StoredOrchestrationPlan>(
       workflow.id,
       "orchestrator.planned",
-      orchestrationPlanSchema,
+      storedOrchestrationPlanSchema,
     );
     if (plan === null) {
-      const turn = await this.executeAgentTurn(
+      const turn = await this.executeAgentTurn<OrchestrationPlan>(
         lease,
         orchestrator,
         orchestrator.run.threadId === null
@@ -476,6 +556,9 @@ export class WorkflowController {
         signal,
       );
       workerOutcome = normalizedOutcome(turn.output, worker.journal.result);
+      ensureResult(worker.journal.result, "worker", workerOutcome, {
+        preserveExisting: true,
+      });
       const usage = addUsage(worker.run.usage, turn.usage);
       this.store.completeAgentRun(
         lease,
@@ -491,7 +574,10 @@ export class WorkflowController {
         turn.effectiveServiceTier,
       );
     }
-    ensureResult(worker.journal.result, "worker", workerOutcome);
+    ensureResult(worker.journal.result, "worker", workerOutcome, {
+      preserveExisting: true,
+      acceptFinalized: true,
+    });
     this.commitCheckpoint(
       repository,
       lease,
@@ -556,6 +642,14 @@ export class WorkflowController {
         turn.output,
         verifier.journal.result,
       );
+      verifierOutcome = validatedVerificationOutcome(
+        verifierOutcome,
+        workflow.workspace,
+        workflow.taskDir,
+      );
+      ensureVerificationResult(verifier.journal.result, verifierOutcome, {
+        preserveExisting: true,
+      });
       const usage = addUsage(verifier.run.usage, turn.usage);
       this.store.completeAgentRun(
         lease,
@@ -571,7 +665,15 @@ export class WorkflowController {
         turn.effectiveServiceTier,
       );
     }
-    ensureVerificationResult(verifier.journal.result, verifierOutcome);
+    verifierOutcome = validatedVerificationOutcome(
+      verifierOutcome,
+      workflow.workspace,
+      workflow.taskDir,
+    );
+    ensureVerificationResult(verifier.journal.result, verifierOutcome, {
+      preserveExisting: true,
+      acceptFinalized: true,
+    });
     this.commitCheckpoint(
       repository,
       lease,
@@ -650,6 +752,10 @@ export class WorkflowController {
         finalTurn.output,
         orchestrator.journal.result,
       );
+      ensureResult(orchestrator.journal.result, "orchestrator", finalOutcome, {
+        preserveExisting: true,
+        evidenceReferences: verifierOutcome.evidence_references,
+      });
       const usage = finalTurn.usage ?? latestOrchestrator.usage;
       this.store.completeAgentRun(
         lease,
@@ -665,7 +771,11 @@ export class WorkflowController {
         finalTurn.effectiveServiceTier,
       );
     }
-    ensureResult(orchestrator.journal.result, "orchestrator", finalOutcome);
+    ensureResult(orchestrator.journal.result, "orchestrator", finalOutcome, {
+      preserveExisting: true,
+      acceptFinalized: true,
+      evidenceReferences: verifierOutcome.evidence_references,
+    });
     this.commitCheckpoint(
       repository,
       lease,
@@ -713,6 +823,9 @@ export class WorkflowController {
         signal,
       );
       workerOutcome = normalizedFastOutcome(turn.output, worker.journal.result);
+      ensureResult(worker.journal.result, "worker", workerOutcome, {
+        preserveExisting: true,
+      });
       const usage = addUsage(worker.run.usage, turn.usage);
       this.store.completeAgentRun(
         lease,
@@ -729,7 +842,10 @@ export class WorkflowController {
       );
     }
     ensureStructuredJournal(worker.journal.journal, workerOutcome);
-    ensureResult(worker.journal.result, "worker", workerOutcome);
+    ensureResult(worker.journal.result, "worker", workerOutcome, {
+      preserveExisting: true,
+      acceptFinalized: true,
+    });
     this.commitCheckpoint(
       repository,
       lease,
@@ -818,6 +934,14 @@ export class WorkflowController {
         turn.output,
         verifier.journal.result,
       );
+      verifierOutcome = validatedVerificationOutcome(
+        verifierOutcome,
+        workflow.workspace,
+        workflow.taskDir,
+      );
+      ensureVerificationResult(verifier.journal.result, verifierOutcome, {
+        preserveExisting: true,
+      });
       const usage = addUsage(verifier.run.usage, turn.usage);
       this.store.completeAgentRun(
         lease,
@@ -833,8 +957,16 @@ export class WorkflowController {
         turn.effectiveServiceTier,
       );
     }
+    verifierOutcome = validatedVerificationOutcome(
+      verifierOutcome,
+      workflow.workspace,
+      workflow.taskDir,
+    );
     ensureStructuredJournal(verifier.journal.journal, verifierOutcome);
-    ensureVerificationResult(verifier.journal.result, verifierOutcome);
+    ensureVerificationResult(verifier.journal.result, verifierOutcome, {
+      preserveExisting: true,
+      acceptFinalized: true,
+    });
     this.commitCheckpoint(
       repository,
       lease,
@@ -846,7 +978,6 @@ export class WorkflowController {
     const terminalOutcome = this.fastTerminalOutcome(
       workerOutcome,
       verifierOutcome,
-      worker.journal,
       verifier.journal,
     );
     const retryRoute =
@@ -1088,6 +1219,13 @@ export class WorkflowController {
     progressEvent?: string,
   ): Promise<AgentTurnResult<T>> {
     this.store.assertWorkflowLease(lease);
+    if (signal?.aborted) {
+      if (signal.reason instanceof WorkflowLeaseLostError) {
+        throw signal.reason;
+      }
+      throw new Error("Workflow execution was cancelled");
+    }
+    prepareResultForTurn(prepared.journal.result);
     if (progressEvent !== undefined) {
       this.store.appendEvent(
         lease,
@@ -1129,6 +1267,12 @@ export class WorkflowController {
       throw new WorkflowLeaseLostError(lease.workflowId);
     }
     this.store.assertWorkflowLease(lease);
+    if (signal?.aborted) {
+      if (signal.reason instanceof WorkflowLeaseLostError) {
+        throw signal.reason;
+      }
+      throw new Error("Workflow execution was cancelled");
+    }
     const persisted = this.requireRun(prepared.run.id);
     if (persisted.threadId === null) {
       this.store.setAgentThread(
@@ -1174,7 +1318,6 @@ export class WorkflowController {
   private fastTerminalOutcome(
     worker: FastWorkerOutcome,
     verifier: VerificationOutcome,
-    workerJournal: AgentJournalPaths,
     verifierJournal: AgentJournalPaths,
   ): AgentOutcome {
     switch (verifier.status) {
@@ -1182,7 +1325,7 @@ export class WorkflowController {
         return {
           status: "completed",
           summary: `${worker.summary} ${verifier.summary}`,
-          result_path: workerJournal.result,
+          result_path: verifierJournal.result,
           questions: [],
           blocker: null,
         };
@@ -1375,7 +1518,7 @@ export class WorkflowController {
       result_path: outcome.result_path,
       questions: outcome.questions,
       blocker: outcome.blocker,
-      usage: usage.usage,
+      usage: usage.status === "unknown" ? null : usage.usage,
       usage_status: usage.status,
       execution_route: executionRoute,
       retry_route: retryRoute,
@@ -1429,6 +1572,52 @@ export class WorkflowController {
       gitDir: join(this.checkpointsDir, `${workflowId}.git`),
       gitPath: this.gitPath,
     });
+  }
+
+  private restoreResumableArtifacts(
+    workflow: StoredWorkflow,
+    repository: CheckpointRepository,
+    lease: WorkflowLease,
+  ): void {
+    const checkpoints = [...this.store.listStoredCheckpoints(workflow.id)].reverse();
+    const resumableRuns = this.store
+      .listStoredAgentRuns(workflow.id)
+      .filter((run) => run.status === "running" && run.threadId !== null);
+
+    for (const run of resumableRuns) {
+      const journal: AgentJournalPaths = {
+        directory: run.taskDir,
+        task: join(run.taskDir, "task.md"),
+        journal: join(run.taskDir, "journal.md"),
+        result: join(run.taskDir, "result.md"),
+      };
+      const taskPath = relative(repository.workTree, journal.task);
+      const journalPath = relative(repository.workTree, journal.journal);
+      const checkpoint = checkpoints.find(
+        (item) =>
+          repository.hasFileAt(item.commitId, taskPath) &&
+          repository.hasFileAt(item.commitId, journalPath),
+      );
+      if (checkpoint === undefined) {
+        throw new Error(
+          `Cannot recover ${run.role} run ${run.id}: no authoritative complete Checkpoint contains ${taskPath} and ${journalPath}`,
+        );
+      }
+      const task = repository.readFileAt(checkpoint.commitId, taskPath);
+      const narrative = repository.readFileAt(checkpoint.commitId, journalPath);
+      if (task.trim() === "" || narrative.trim() === "") {
+        throw new Error(
+          `Cannot recover ${run.role} run ${run.id}: Checkpoint ${checkpoint.commitId} contains an empty Task or Journal`,
+        );
+      }
+      restoreAgentJournal(journal, task, narrative);
+      this.store.appendEvent(lease, run.id, "journal.restored", {
+        checkpoint_kind: checkpoint.kind,
+        commit_id: checkpoint.commitId,
+        task_path: journal.task,
+        journal_path: journal.journal,
+      });
+    }
   }
 
   private assertWorkflowIdentity(

@@ -3,7 +3,12 @@ import { z } from "zod";
 export const roleSchema = z.enum(["orchestrator", "worker", "verifier"]);
 export type AgentRole = z.infer<typeof roleSchema>;
 
+export const reasoningEffortSchema = z.enum(["high", "xhigh", "max"]);
+export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+
 export const modelProfileSchema = z.enum([
+  "luna_high",
+  "luna_xhigh",
   "luna_max",
   "terra_high",
   "sol_high",
@@ -19,10 +24,18 @@ export type ExecutionRoute = z.infer<typeof executionRouteSchema>;
 
 export interface ModelProfileDefinition {
   model: string;
-  reasoningEffort: "high" | "max";
+  reasoningEffort: ReasoningEffort;
 }
 
 export const modelProfiles: Readonly<Record<ModelProfile, ModelProfileDefinition>> = {
+  luna_high: {
+    model: "gpt-5.6-luna",
+    reasoningEffort: "high",
+  },
+  luna_xhigh: {
+    model: "gpt-5.6-luna",
+    reasoningEffort: "xhigh",
+  },
   luna_max: {
     model: "gpt-5.6-luna",
     reasoningEffort: "max",
@@ -95,7 +108,111 @@ export function addUsage(left: AgentUsage, right: AgentUsage | null): AgentUsage
 
 const emptyStringsSchema = z.array(z.string().min(1)).length(0);
 
-export const orchestrationPlanSchema = z.discriminatedUnion("status", [
+export const workerTaskClassSchema = z.enum([
+  "short_bounded",
+  "bounded_execution",
+  "long_horizon_execution",
+  "bounded_judgment",
+  "irreducible_synthesis",
+  "critical_deliberation",
+]);
+export type WorkerTaskClass = z.infer<typeof workerTaskClassSchema>;
+
+export const verifierTaskClassSchema = z.enum([
+  "mechanical_check",
+  "bounded_evidence_review",
+  "irreducible_review",
+  "critical_review",
+]);
+export type VerifierTaskClass = z.infer<typeof verifierTaskClassSchema>;
+
+export const workerRouteProfiles: Readonly<Record<WorkerTaskClass, ModelProfile>> = {
+  short_bounded: "luna_high",
+  bounded_execution: "luna_xhigh",
+  long_horizon_execution: "luna_max",
+  bounded_judgment: "terra_high",
+  irreducible_synthesis: "sol_high",
+  critical_deliberation: "sol_max",
+};
+
+export const verifierRouteProfiles: Readonly<
+  Record<VerifierTaskClass, ModelProfile>
+> = {
+  mechanical_check: "luna_high",
+  bounded_evidence_review: "terra_high",
+  irreducible_review: "sol_high",
+  critical_review: "sol_max",
+};
+
+export const workerRouteDecisionSchema = z.object({
+  task_class: workerTaskClassSchema,
+  residual_burden: z.string().min(1),
+  why_lower_cost_route_is_insufficient: z.string().min(1),
+  upgrade_trigger: z.string().min(1),
+});
+export type WorkerRouteDecision = z.infer<typeof workerRouteDecisionSchema>;
+
+export const verifierRouteDecisionSchema = z.object({
+  task_class: verifierTaskClassSchema,
+  residual_burden: z.string().min(1),
+  why_lower_cost_route_is_insufficient: z.string().min(1),
+  upgrade_trigger: z.string().min(1),
+});
+export type VerifierRouteDecision = z.infer<
+  typeof verifierRouteDecisionSchema
+>;
+
+const orchestrationPlanModelSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("ready"),
+    summary: z.string().min(1),
+    worker_task: z.string().min(1),
+    worker_route: workerRouteDecisionSchema,
+    verifier_route: verifierRouteDecisionSchema,
+    completion_criteria: z.array(z.string().min(1)).min(1),
+    questions: emptyStringsSchema,
+    blocker: z.null(),
+  }),
+  z.object({
+    status: z.literal("needs_input"),
+    summary: z.string().min(1),
+    worker_task: z.null(),
+    worker_route: z.null(),
+    verifier_route: z.null(),
+    completion_criteria: emptyStringsSchema,
+    questions: z.array(z.string().min(1)).min(1),
+    blocker: z.null(),
+  }),
+  z.object({
+    status: z.literal("blocked"),
+    summary: z.string().min(1),
+    worker_task: z.null(),
+    worker_route: z.null(),
+    verifier_route: z.null(),
+    completion_criteria: emptyStringsSchema,
+    questions: emptyStringsSchema,
+    blocker: z.string().min(1),
+  }),
+]);
+
+export const orchestrationPlanSchema = orchestrationPlanModelSchema.transform(
+  (plan) =>
+    plan.status === "ready"
+      ? {
+          ...plan,
+          worker_profile: workerRouteProfiles[plan.worker_route.task_class],
+          verifier_profile:
+            verifierRouteProfiles[plan.verifier_route.task_class],
+        }
+      : {
+          ...plan,
+          worker_profile: null,
+          verifier_profile: null,
+        },
+);
+export type OrchestrationPlan = z.infer<typeof orchestrationPlanSchema>;
+
+const legacyOrchestrationPlanSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("ready"),
     summary: z.string().min(1),
@@ -126,8 +243,19 @@ export const orchestrationPlanSchema = z.discriminatedUnion("status", [
     questions: emptyStringsSchema,
     blocker: z.string().min(1),
   }),
+]).transform((plan) => ({
+  ...plan,
+  worker_route: null,
+  verifier_route: null,
+}));
+
+export const storedOrchestrationPlanSchema = z.union([
+  orchestrationPlanSchema,
+  legacyOrchestrationPlanSchema,
 ]);
-export type OrchestrationPlan = z.infer<typeof orchestrationPlanSchema>;
+export type StoredOrchestrationPlan = z.infer<
+  typeof storedOrchestrationPlanSchema
+>;
 
 // OpenAI Structured Outputs requires a root object and rejects the top-level
 // `oneOf` emitted for Zod discriminated unions. These wire schemas describe
@@ -137,8 +265,8 @@ export const orchestrationPlanWireSchema = z.object({
   status: z.enum(["ready", "needs_input", "blocked"]),
   summary: z.string().min(1),
   worker_task: z.string().min(1).nullable(),
-  worker_profile: modelProfileSchema.nullable(),
-  verifier_profile: modelProfileSchema.nullable(),
+  worker_route: workerRouteDecisionSchema.nullable(),
+  verifier_route: verifierRouteDecisionSchema.nullable(),
   completion_criteria: z.array(z.string().min(1)),
   questions: z.array(z.string().min(1)),
   blocker: z.string().min(1).nullable(),
@@ -218,13 +346,25 @@ export const verificationFindingSchema = z.object({
 });
 export type VerificationFinding = z.infer<typeof verificationFindingSchema>;
 
+export const verificationEvidenceReferenceSchema = z.object({
+  claim: z.string().min(1),
+  artifact_path: z.string().min(1),
+});
+export type VerificationEvidenceReference = z.infer<
+  typeof verificationEvidenceReferenceSchema
+>;
+
 const emptyFindingsSchema = z.array(verificationFindingSchema).length(0);
+const evidenceReferencesSchema = z
+  .array(verificationEvidenceReferenceSchema)
+  .default([]);
 
 export const verificationOutcomeSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("passed"),
     summary: z.string().min(1),
     findings: emptyFindingsSchema,
+    evidence_references: evidenceReferencesSchema,
     result_path: resultPathSchema,
     questions: emptyStringsSchema,
     blocker: z.null(),
@@ -233,6 +373,7 @@ export const verificationOutcomeSchema = z.discriminatedUnion("status", [
     status: z.literal("findings"),
     summary: z.string().min(1),
     findings: z.array(verificationFindingSchema).min(1),
+    evidence_references: evidenceReferencesSchema,
     result_path: resultPathSchema,
     questions: emptyStringsSchema,
     blocker: z.null(),
@@ -241,6 +382,7 @@ export const verificationOutcomeSchema = z.discriminatedUnion("status", [
     status: z.literal("needs_input"),
     summary: z.string().min(1),
     findings: emptyFindingsSchema,
+    evidence_references: evidenceReferencesSchema,
     result_path: resultPathSchema,
     questions: z.array(z.string().min(1)).min(1),
     blocker: z.null(),
@@ -249,6 +391,7 @@ export const verificationOutcomeSchema = z.discriminatedUnion("status", [
     status: z.literal("blocked"),
     summary: z.string().min(1),
     findings: emptyFindingsSchema,
+    evidence_references: evidenceReferencesSchema,
     result_path: resultPathSchema,
     questions: emptyStringsSchema,
     blocker: z.string().min(1),
@@ -260,6 +403,7 @@ export const verificationOutcomeWireSchema = z.object({
   status: z.enum(["passed", "findings", "needs_input", "blocked"]),
   summary: z.string().min(1),
   findings: z.array(verificationFindingSchema),
+  evidence_references: z.array(verificationEvidenceReferenceSchema),
   result_path: resultPathSchema,
   questions: z.array(z.string().min(1)),
   blocker: z.string().min(1).nullable(),
@@ -303,7 +447,7 @@ export const workflowRunOutputSchema = z.object({
   result_path: z.string().min(1).nullable(),
   questions: z.array(z.string().min(1)),
   blocker: z.string().min(1).nullable(),
-  usage: usageSchema,
+  usage: usageSchema.nullable(),
   usage_status: usageStatusSchema.default("unknown"),
   execution_route: executionRouteSchema,
   retry_route: z.literal("orchestrated").nullable(),
@@ -343,6 +487,20 @@ export const workflowRunOutputSchema = z.object({
         code: "custom",
         path: ["failure_kind"],
         message: `${output.status} outcomes cannot contain a failure kind`,
+      });
+    }
+
+    if (output.usage_status === "unknown" && output.usage !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["usage"],
+        message: "unknown usage must not expose placeholder numeric values",
+      });
+    } else if (output.usage_status !== "unknown" && output.usage === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["usage"],
+        message: `${output.usage_status} usage requires observed numeric values`,
       });
     }
 

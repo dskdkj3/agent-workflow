@@ -12,6 +12,8 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { CheckpointRepository } from "./checkpoints.js";
+import { emptyUsage } from "./contracts.js";
+import { StateStore } from "./state.js";
 
 test("preserves semantic journal versions and rejects frozen-file rewrites", (t) => {
   const root = mkdtempSync(join(tmpdir(), "agent-workflow-checkpoints-"));
@@ -114,4 +116,88 @@ test("finds checkpoints only from the requested lease epoch", (t) => {
   assert.deepEqual(repository.findCommit("worker.completed", 1), first);
   assert.deepEqual(repository.findCommit("worker.completed", 2), second);
   assert.equal(repository.findCommit("worker.completed", 3), null);
+});
+
+test("keeps a commit from a superseded lease non-authoritative", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "agent-workflow-checkpoint-takeover-"));
+  const workTree = join(root, "task");
+  const agentDir = join(workTree, "workers", "worker-1");
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(join(agentDir, "task.md"), "# Task\n\nTakeover test\n", "utf8");
+  writeFileSync(join(agentDir, "journal.md"), "# Journal\n\nOld epoch\n", "utf8");
+  const workflowId = "00000000-0000-4000-8000-000000000061";
+  const store = new StateStore(join(root, "controller.sqlite3"));
+  store.createWorkflow(
+    workflowId,
+    "Define checkpoint takeover authority",
+    root,
+    workTree,
+    "single_worker",
+    ["Only the current lease checkpoint is authoritative"],
+    emptyUsage(),
+  );
+  const oldLease = store.claimWorkflow(workflowId, "old-owner", 60_000);
+  assert.ok(oldLease);
+  store.createAgentRun(oldLease, {
+    id: "takeover-worker",
+    workflowId,
+    parentRunId: null,
+    role: "worker",
+    profile: "luna_high",
+    taskDir: agentDir,
+    model: "gpt-5.6-luna",
+    reasoningEffort: "high",
+    requestedServiceTier: "default",
+  });
+  const repository = new CheckpointRepository({
+    workTree,
+    gitDir: join(root, "history.git"),
+  });
+  t.after(() => {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const staleCommit = repository.commit("worker.completed", {
+    leaseEpoch: oldLease.epoch,
+  });
+  store.database
+    .prepare("UPDATE workflows SET lease_expires_at = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", workflowId);
+  const currentLease = store.claimWorkflow(workflowId, "current-owner", 60_000);
+  assert.ok(currentLease);
+  assert.throws(
+    () =>
+      store.recordCheckpoint(
+        oldLease,
+        "takeover-worker",
+        staleCommit.kind,
+        staleCommit.id,
+      ),
+    /lease was lost/,
+  );
+
+  writeFileSync(join(agentDir, "journal.md"), "# Journal\n\nCurrent epoch\n", "utf8");
+  const currentCommit = repository.commit("worker.completed", {
+    leaseEpoch: currentLease.epoch,
+  });
+  store.recordCheckpoint(
+    currentLease,
+    "takeover-worker",
+    currentCommit.kind,
+    currentCommit.id,
+  );
+
+  assert.deepEqual(
+    store.listStoredCheckpoints(workflowId).map((item) => item.commitId),
+    [currentCommit.id],
+  );
+  assert.deepEqual(
+    repository.findCommit("worker.completed", oldLease.epoch),
+    staleCommit,
+  );
+  assert.deepEqual(
+    repository.findCommit("worker.completed", currentLease.epoch),
+    currentCommit,
+  );
 });

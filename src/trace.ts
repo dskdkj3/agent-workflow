@@ -4,11 +4,17 @@ import { isAbsolute, join, resolve } from "node:path";
 import {
   addUsage,
   emptyUsage,
+  storedOrchestrationPlanSchema,
   type AgentRole,
   type AgentUsage,
   type ExecutionRoute,
   type ModelProfile,
+  type ReasoningEffort,
   type UsageStatus,
+  type VerifierRouteDecision,
+  type VerifierTaskClass,
+  type WorkerRouteDecision,
+  type WorkerTaskClass,
 } from "./contracts.js";
 import {
   StateStore,
@@ -26,7 +32,7 @@ export type WorkflowTraceStatus =
 
 export interface TraceMeasurement<T> {
   status: UsageStatus;
-  value: T;
+  value: T | null;
   source: string | null;
 }
 
@@ -42,6 +48,18 @@ export interface TraceFastState {
   requested_fast: boolean | null;
   effective_service_tier: string | null;
   effective_fast: boolean | null;
+}
+
+export interface TraceRoutingDecision {
+  source: "fixed" | "orchestrator" | "legacy_unknown";
+  task_class:
+    | WorkerTaskClass
+    | VerifierTaskClass
+    | "orchestration"
+    | null;
+  residual_burden: string | null;
+  why_lower_cost_route_is_insufficient: string | null;
+  upgrade_trigger: string | null;
 }
 
 export interface TraceWorkflowFastState {
@@ -74,7 +92,8 @@ export interface TraceAgent {
   role: AgentRole;
   profile: ModelProfile;
   model: string;
-  reasoning_effort: "high" | "max";
+  reasoning_effort: ReasoningEffort;
+  routing: TraceRoutingDecision;
   status: string;
   thread_id: string | null;
   task_dir: string;
@@ -158,6 +177,111 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function traceRoute(
+  source: TraceRoutingDecision["source"],
+  decision: WorkerRouteDecision | VerifierRouteDecision,
+): TraceRoutingDecision {
+  return {
+    source,
+    task_class: decision.task_class,
+    residual_burden: decision.residual_burden,
+    why_lower_cost_route_is_insufficient:
+      decision.why_lower_cost_route_is_insufficient,
+    upgrade_trigger: decision.upgrade_trigger,
+  };
+}
+
+function unknownLegacyRoute(): TraceRoutingDecision {
+  return {
+    source: "legacy_unknown",
+    task_class: null,
+    residual_burden: null,
+    why_lower_cost_route_is_insufficient: null,
+    upgrade_trigger: null,
+  };
+}
+
+function fixedOrchestratorRoute(): TraceRoutingDecision {
+  return {
+    source: "fixed",
+    task_class: "orchestration",
+    residual_burden:
+      "Interpret the accepted request, classify residual task shape, and judge the verified result.",
+    why_lower_cost_route_is_insufficient:
+      "The default route assigns request-level synthesis and final judgment to the Sol high Orchestrator.",
+    upgrade_trigger:
+      "A critical system-defining decision that Sol high is unlikely to resolve must be surfaced instead of silently delegated.",
+  };
+}
+
+function fixedFastWorkerRoute(): TraceRoutingDecision {
+  return traceRoute("fixed", {
+    task_class: "short_bounded",
+    residual_burden:
+      "Execute one already-bounded task with explicit observable completion criteria.",
+    why_lower_cost_route_is_insufficient:
+      "The request requires Workspace execution, so the Interaction direct-answer path is insufficient.",
+    upgrade_trigger:
+      "Escalate when execution reveals ambiguity, broader scope, weak feedback, or a material design decision.",
+  });
+}
+
+function fixedFastVerifierRoute(): TraceRoutingDecision {
+  return traceRoute("fixed", {
+    task_class: "mechanical_check",
+    residual_burden:
+      "Independently check the bounded result against explicit observable criteria.",
+    why_lower_cost_route_is_insufficient:
+      "Independent model-visible verification is still required after deterministic checks.",
+    upgrade_trigger:
+      "Escalate when verification requires non-mechanical evidence judgment or broader architectural review.",
+  });
+}
+
+interface TraceRouteSet {
+  orchestrator: TraceRoutingDecision;
+  worker: TraceRoutingDecision;
+  verifier: TraceRoutingDecision;
+}
+
+function traceRoutes(
+  executionRoute: ExecutionRoute,
+  events: StoredEvent[],
+): TraceRouteSet {
+  if (executionRoute === "single_worker") {
+    return {
+      orchestrator: fixedOrchestratorRoute(),
+      worker: fixedFastWorkerRoute(),
+      verifier: fixedFastVerifierRoute(),
+    };
+  }
+
+  const planned = events.findLast(
+    (event) => event.type === "orchestrator.planned",
+  );
+  const payload = planned !== undefined && isRecord(planned.payload)
+    ? planned.payload
+    : null;
+  const parsed = storedOrchestrationPlanSchema.safeParse(payload?.outcome);
+  if (!parsed.success || parsed.data.status !== "ready") {
+    return {
+      orchestrator: fixedOrchestratorRoute(),
+      worker: unknownLegacyRoute(),
+      verifier: unknownLegacyRoute(),
+    };
+  }
+
+  return {
+    orchestrator: fixedOrchestratorRoute(),
+    worker: parsed.data.worker_route === null
+      ? unknownLegacyRoute()
+      : traceRoute("orchestrator", parsed.data.worker_route),
+    verifier: parsed.data.verifier_route === null
+      ? unknownLegacyRoute()
+      : traceRoute("orchestrator", parsed.data.verifier_route),
+  };
+}
+
 function durationMs(start: string, end: string | null): number | null {
   const startMs = Date.parse(start);
   const endMs = end === null ? NaN : Date.parse(end);
@@ -187,7 +311,7 @@ function usageMeasurement(
 ): TraceMeasurement<AgentUsage> {
   return {
     status,
-    value: usage,
+    value: status === "unknown" ? null : usage,
     source:
       status === "unknown"
         ? null
@@ -312,33 +436,51 @@ function evidenceReferences(
       continue;
     }
     const outcome = event.payload.outcome;
-    if (!isRecord(outcome) || !Array.isArray(outcome.findings)) {
+    if (!isRecord(outcome)) {
       continue;
     }
-    for (const finding of outcome.findings) {
+    const artifactPath = (value: string): string | null => {
+      if (!isAbsolute(value)) {
+        return null;
+      }
+      const resolved = resolve(value);
+      return resolved === resolve(workspace) ||
+        resolved.startsWith(`${resolve(workspace)}/`) ||
+        resolved === resolve(taskDir) ||
+        resolved.startsWith(`${resolve(taskDir)}/`)
+        ? resolved
+        : null;
+    };
+    const evidence = Array.isArray(outcome.evidence_references)
+      ? outcome.evidence_references
+      : [];
+    for (const reference of evidence) {
+      if (!isRecord(reference)) {
+        continue;
+      }
+      const claim = String(reference.claim ?? "Verified completion claim");
+      const path = String(reference.artifact_path ?? "Unspecified artifact");
+      references.push({
+        run_id: event.runId,
+        event_sequence: event.sequence,
+        issue: claim,
+        evidence: path,
+        artifact_path: artifactPath(path),
+      });
+    }
+    const findings = Array.isArray(outcome.findings) ? outcome.findings : [];
+    for (const finding of findings) {
       if (!isRecord(finding)) {
         continue;
       }
       const issue = String(finding.issue ?? "Unspecified verification finding");
       const evidence = String(finding.evidence ?? "Unspecified evidence");
-      let evidencePath: string | null = null;
-      if (isAbsolute(evidence)) {
-        const resolved = resolve(evidence);
-        if (
-          resolved === resolve(workspace) ||
-          resolved.startsWith(`${resolve(workspace)}/`) ||
-          resolved === resolve(taskDir) ||
-          resolved.startsWith(`${resolve(taskDir)}/`)
-        ) {
-          evidencePath = resolved;
-        }
-      }
       references.push({
         run_id: event.runId,
         event_sequence: event.sequence,
         issue,
         evidence,
-        artifact_path: evidencePath,
+        artifact_path: artifactPath(evidence),
       });
     }
   }
@@ -348,6 +490,7 @@ function evidenceReferences(
 function buildAgentTree(
   runs: StoredAgentRun[],
   generatedAt: string,
+  routes: TraceRouteSet,
 ): TraceAgent[] {
   const childrenByParent = new Map<string | null, StoredAgentRun[]>();
   for (const run of runs) {
@@ -363,6 +506,7 @@ function buildAgentTree(
     profile: run.profile,
     model: run.model,
     reasoning_effort: run.reasoningEffort,
+    routing: routes[run.role],
     status: run.status,
     thread_id: run.threadId,
     task_dir: run.taskDir,
@@ -510,7 +654,11 @@ export function buildWorkflowTrace(
       ),
       quota_equivalent: unknownQuota(),
     },
-    agents: buildAgentTree(runs, generatedAt),
+    agents: buildAgentTree(
+      runs,
+      generatedAt,
+      traceRoutes(workflow.executionRoute, events),
+    ),
     timeline: events.map((event) => ({
       sequence: event.sequence,
       run_id: event.runId,

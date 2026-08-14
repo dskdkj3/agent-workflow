@@ -7,6 +7,7 @@ import {
   executionRouteSchema,
   modelProfileSchema,
   modelProfiles,
+  reasoningEffortSchema,
   roleSchema,
   usageSchema,
   usageStatusSchema,
@@ -15,6 +16,7 @@ import {
   type AgentUsage,
   type ExecutionRoute,
   type ModelProfile,
+  type ReasoningEffort,
   type RecoveryDecisionInput,
   type RecoveryDecisionOutput,
   type UsageStatus,
@@ -31,7 +33,7 @@ export interface CreateAgentRun {
   profile: ModelProfile;
   taskDir: string;
   model: string;
-  reasoningEffort: "high" | "max";
+  reasoningEffort: ReasoningEffort;
   requestedServiceTier: string;
 }
 
@@ -80,7 +82,7 @@ export interface StoredAgentRun {
   role: AgentRole;
   profile: ModelProfile;
   model: string;
-  reasoningEffort: "high" | "max";
+  reasoningEffort: ReasoningEffort;
   requestedServiceTier: string;
   effectiveServiceTier: string | null;
   taskDir: string;
@@ -185,9 +187,7 @@ function rowToAgentRun(row: Record<string, unknown>): StoredAgentRun {
     reasoningEffort:
       row.reasoning_effort === null || row.reasoning_effort === undefined
         ? profileDefinition.reasoningEffort
-        : row.reasoning_effort === "max"
-          ? "max"
-          : "high",
+        : reasoningEffortSchema.parse(row.reasoning_effort),
     requestedServiceTier:
       row.requested_service_tier === null ||
       row.requested_service_tier === undefined
@@ -447,7 +447,7 @@ export class StateStore {
           output.result_path,
           JSON.stringify(output.questions),
           output.blocker,
-          JSON.stringify(output.usage),
+          JSON.stringify(output.usage ?? emptyUsage()),
           output.usage_status,
           output.failure_kind,
           output.recovery_requires_user_approval ? 1 : 0,
@@ -477,7 +477,7 @@ export class StateStore {
       result_path: workflow.resultPath,
       questions: workflow.questions,
       blocker: workflow.blocker,
-      usage: workflow.usage,
+      usage: workflow.usageStatus === "unknown" ? null : workflow.usage,
       usage_status: workflow.usageStatus,
       execution_route: workflow.executionRoute,
       retry_route: this.terminalRetryRoute(id),

@@ -30,6 +30,7 @@ import {
   WorkflowController,
   WorkflowInterruptedError,
 } from "./controller.js";
+import { buildWorkflowTrace } from "./trace.js";
 
 interface FakeStep {
   kind: "start" | "continue";
@@ -50,6 +51,7 @@ type RunnerCall =
       workspace: string;
       taskDir: string;
       prompt: string;
+      journal: string;
     }
   | {
       kind: "continue";
@@ -59,6 +61,7 @@ type RunnerCall =
       workspace: string;
       taskDir: string;
       prompt: string;
+      journal: string;
     };
 
 class FakeAgentRunner implements AgentRunner {
@@ -76,6 +79,7 @@ class FakeAgentRunner implements AgentRunner {
       workspace: request.workspace,
       taskDir: request.taskDir,
       prompt: request.prompt,
+      journal: readFileSync(join(request.taskDir, "journal.md"), "utf8"),
     });
     return this.take("start", request);
   }
@@ -91,6 +95,7 @@ class FakeAgentRunner implements AgentRunner {
       workspace: request.workspace,
       taskDir: request.taskDir,
       prompt: request.prompt,
+      journal: readFileSync(join(request.taskDir, "journal.md"), "utf8"),
     });
     return this.take("continue", request);
   }
@@ -190,6 +195,52 @@ class AbortableRunner implements AgentRunner {
   }
 }
 
+class AbortIgnoringWorkerRunner implements AgentRunner {
+  readonly calls: AgentRole[] = [];
+  readonly workerStarted: Promise<void>;
+  private resolveWorkerStarted!: () => void;
+
+  constructor(private readonly includePlanningTurn: boolean) {
+    this.workerStarted = new Promise((resolvePromise) => {
+      this.resolveWorkerStarted = resolvePromise;
+    });
+  }
+
+  async start<T>(request: AgentTurnRequest<T>): Promise<AgentTurnResult<T>> {
+    this.calls.push(request.role);
+    if (this.includePlanningTurn && request.role === "orchestrator") {
+      await request.onThreadStarted?.("abort-ignoring-orchestrator");
+      return {
+        threadId: "abort-ignoring-orchestrator",
+        output: request.schema.parse(readyPlan()),
+        usage: planUsage,
+      };
+    }
+    await request.onThreadStarted?.("abort-ignoring-worker");
+    this.resolveWorkerStarted();
+    await new Promise<void>((resolvePromise) => {
+      if (request.signal?.aborted) {
+        resolvePromise();
+        return;
+      }
+      request.signal?.addEventListener("abort", () => resolvePromise(), {
+        once: true,
+      });
+    });
+    return {
+      threadId: "abort-ignoring-worker",
+      output: request.schema.parse(completedWorker("late success after abort")),
+      usage: workerUsage,
+    };
+  }
+
+  async continue<T>(
+    _request: ContinueAgentTurnRequest<T>,
+  ): Promise<AgentTurnResult<T>> {
+    throw new Error("Unexpected continue after cancellation");
+  }
+}
+
 const planUsage: AgentUsage = {
   input_tokens: 10,
   cached_input_tokens: 2,
@@ -244,15 +295,45 @@ function createFixture(): {
   root: string;
   workspace: string;
   stateDir: string;
+  evidencePath: string;
 } {
   const root = mkdtempSync(join(tmpdir(), "agent-workflow-controller-"));
   const workspace = join(root, "workspace");
   mkdirSync(workspace);
-  return { root, workspace, stateDir: join(root, "state") };
+  const evidencePath = join(workspace, "verification-evidence.txt");
+  writeFileSync(evidencePath, "durable independent fixture evidence\n", "utf8");
+  return {
+    root,
+    workspace,
+    stateDir: join(root, "state"),
+    evidencePath,
+  };
 }
 
 function mode(path: string): number {
   return statSync(path).mode & 0o777;
+}
+
+function workerRoute(taskClass = "bounded_execution") {
+  return {
+    task_class: taskClass,
+    residual_burden: "The fixture needs bounded repository execution.",
+    why_lower_cost_route_is_insufficient:
+      "A direct answer cannot make and validate the Workspace change.",
+    upgrade_trigger:
+      "Escalate if the fixture exposes unresolved intent or broader architecture.",
+  };
+}
+
+function verifierRoute(taskClass = "bounded_evidence_review") {
+  return {
+    task_class: taskClass,
+    residual_burden: "The fixture result needs independent evidence review.",
+    why_lower_cost_route_is_insufficient:
+      "The result is not decided by one fully mechanical assertion.",
+    upgrade_trigger:
+      "Escalate if verification requires a new system-level judgment.",
+  };
 }
 
 function readyPlan(
@@ -262,8 +343,8 @@ function readyPlan(
     status: "ready",
     summary: "Delegation is ready",
     worker_task: "Implement the requested fixture change",
-    worker_profile: "luna_max",
-    verifier_profile: "terra_high",
+    worker_route: workerRoute(),
+    verifier_route: verifierRoute(),
     completion_criteria: ["The fixture change is present"],
     questions: [],
     blocker: null,
@@ -281,11 +362,20 @@ function completedWorker(summary = "Worker completed the fixture change") {
   };
 }
 
-function passedVerification(summary = "Independent verification passed") {
+function passedVerification(
+  evidencePath: string,
+  summary = "Independent verification passed",
+) {
   return {
     status: "passed",
     summary,
     findings: [],
+    evidence_references: [
+      {
+        claim: "The fixture completion criteria are satisfied",
+        artifact_path: evidencePath,
+      },
+    ],
     result_path: null,
     questions: [],
     blocker: null,
@@ -342,8 +432,8 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
         status: "ready",
         summary: "Delegation is ready",
         worker_task: "Implement the requested fixture change",
-        worker_profile: "luna_max",
-        verifier_profile: "terra_high",
+        worker_route: workerRoute(),
+        verifier_route: verifierRoute(),
         completion_criteria: ["The fixture change is present", "Tests pass"],
         questions: [],
         blocker: null,
@@ -363,6 +453,9 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
       },
       usage: workerUsage,
       journal: "# Journal\n\nThe requested fixture change is implemented and tested.\n",
+      result:
+        "# Detailed implementation report\n\n" +
+        "DECISIVE_EVIDENCE_REFERENCE: the complete audit matrix remains here.\n",
     },
     {
       kind: "start",
@@ -371,6 +464,12 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
         status: "passed",
         summary: "Independent verification passed",
         findings: [],
+        evidence_references: [
+          {
+            claim: "The fixture change is present and tests pass",
+            artifact_path: fixture.evidencePath,
+          },
+        ],
         result_path: null,
         questions: [],
         blocker: null,
@@ -416,7 +515,7 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
     runner.calls.map((call) => [call.kind, call.role, call.profile]),
     [
       ["start", "orchestrator", "sol_high"],
-      ["start", "worker", "luna_max"],
+      ["start", "worker", "luna_xhigh"],
       ["start", "verifier", "terra_high"],
       ["continue", "orchestrator", "sol_high"],
     ],
@@ -469,10 +568,21 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
     readFileSync(join(verifierDir, "result.md"), "utf8"),
     /Independent verification passed/,
   );
+  assert.match(
+    readFileSync(join(workerDir, "result.md"), "utf8"),
+    /DECISIVE_EVIDENCE_REFERENCE/,
+  );
+  assert.match(
+    readFileSync(join(orchestratorDir, "result.md"), "utf8"),
+    new RegExp(fixture.evidencePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
 
   const workflow = controller.store.getWorkflow(output.workflow_id);
   assert.equal(workflow?.status, "completed");
   assert.deepEqual(JSON.parse(String(workflow?.usage_json)), output.usage);
+  const trace = buildWorkflowTrace(controller.store, output.workflow_id);
+  assert.equal(trace.evidence[0]?.artifact_path, fixture.evidencePath);
+  assert.equal(trace.evidence[0]?.issue, "The fixture change is present and tests pass");
 
   const runs = controller.store.listAgentRuns(output.workflow_id);
   assert.equal(runs.length, 3);
@@ -493,7 +603,7 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
     orchestratorCumulativeUsage,
   );
   assert.equal(workerRun.status, "completed");
-  assert.equal(workerRun.profile, "luna_max");
+  assert.equal(workerRun.profile, "luna_xhigh");
   assert.equal(workerRun.thread_id, "worker-thread");
   assert.equal(workerRun.parent_run_id, orchestratorRun.id);
   assert.equal(verifierRun.status, "completed");
@@ -539,6 +649,13 @@ test("runs Orchestrator -> Worker -> Verifier -> same Orchestrator and persists 
       "orchestrator/journal.md",
     ),
     /completion criteria are ready/,
+  );
+  assert.match(
+    checkpointRepository.readFileAt(
+      String(checkpoints[3]?.commit_id),
+      "workers/worker-1/result.md",
+    ),
+    /DECISIVE_EVIDENCE_REFERENCE/,
   );
   assert.match(
     checkpointRepository.readFileAt(
@@ -601,6 +718,12 @@ test("runs an explicit single-Worker fast path with independent verification", a
         status: "passed",
         summary: "The observable criterion is satisfied",
         findings: [],
+        evidence_references: [
+          {
+            claim: "The bounded result is observable",
+            artifact_path: fixture.evidencePath,
+          },
+        ],
         result_path: null,
         questions: [],
         blocker: null,
@@ -631,8 +754,8 @@ test("runs an explicit single-Worker fast path with independent verification", a
   assert.deepEqual(
     runner.calls.map((call) => [call.role, call.profile]),
     [
-      ["worker", "luna_max"],
-      ["verifier", "luna_max"],
+      ["worker", "luna_high"],
+      ["verifier", "luna_high"],
     ],
   );
   const fastWorkerCall = runner.calls[0];
@@ -670,6 +793,107 @@ test("runs an explicit single-Worker fast path with independent verification", a
   assert.equal(
     controller.store.getWorkflow(output.workflow_id)?.execution_route,
     "single_worker",
+  );
+});
+
+test("rejects passed Verification without Evidence References on the fast path", async (t) => {
+  const fixture = createFixture();
+  const runner = new FakeAgentRunner([
+    {
+      kind: "start",
+      threadId: "fast-no-evidence-worker",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "fast-no-evidence-verifier",
+      output: {
+        status: "passed",
+        summary: "The Verifier claimed success without durable evidence",
+        findings: [],
+        evidence_references: [],
+        result_path: null,
+        questions: [],
+        blocker: null,
+      },
+      usage: verifierUsage,
+    },
+  ]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+  });
+  t.after(() => {
+    controller.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  const output = await controller.run({
+    request: "Reject a fast completion without evidence",
+    workspace: fixture.workspace,
+    execution_route: "single_worker",
+    completion_criteria: ["The result has durable independent evidence"],
+  });
+
+  assert.equal(output.status, "failed");
+  assert.equal(output.failure_kind, "verification_rejected");
+  assert.equal(runner.calls.length, 2);
+  assert.match(
+    readFileSync(String(output.result_path), "utf8"),
+    /passed without an Evidence Reference/,
+  );
+});
+
+test("rejects passed Verification without Evidence References before final orchestration", async (t) => {
+  const fixture = createFixture();
+  const runner = new FakeAgentRunner([
+    {
+      kind: "start",
+      threadId: "no-evidence-orchestrator",
+      output: readyPlan(),
+      usage: planUsage,
+    },
+    {
+      kind: "start",
+      threadId: "no-evidence-worker",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "no-evidence-verifier",
+      output: {
+        status: "passed",
+        summary: "The Verifier claimed success without durable evidence",
+        findings: [],
+        evidence_references: [],
+        result_path: null,
+        questions: [],
+        blocker: null,
+      },
+      usage: verifierUsage,
+    },
+  ]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+  });
+  t.after(() => {
+    controller.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  const output = await controller.run({
+    request: "Reject an orchestrated completion without evidence",
+    workspace: fixture.workspace,
+  });
+
+  assert.equal(output.status, "failed");
+  assert.equal(output.failure_kind, "verification_rejected");
+  assert.deepEqual(
+    runner.calls.map((call) => call.role),
+    ["orchestrator", "worker", "verifier"],
   );
 });
 
@@ -802,8 +1026,8 @@ test("independent findings reject the result without a final Orchestrator turn",
         status: "ready",
         summary: "Delegation is ready",
         worker_task: "Implement the requested fixture change",
-        worker_profile: "luna_max",
-        verifier_profile: "sol_high",
+        worker_route: workerRoute("long_horizon_execution"),
+        verifier_route: verifierRoute("irreducible_review"),
         completion_criteria: ["The requested behavior is observable"],
         questions: [],
         blocker: null,
@@ -891,8 +1115,8 @@ test("returns needs_input from the planning turn without starting a Worker", asy
         status: "needs_input",
         summary: "A target choice is required",
         worker_task: null,
-        worker_profile: null,
-        verifier_profile: null,
+        worker_route: null,
+        verifier_route: null,
         completion_criteria: [],
         questions: ["Which target should be changed?"],
         blocker: null,
@@ -942,8 +1166,8 @@ test("converts a runner failure into a failed workflow", async (t) => {
         status: "ready",
         summary: "Worker can proceed",
         worker_task: "Run the failing worker fixture",
-        worker_profile: "luna_max",
-        verifier_profile: "terra_high",
+        worker_route: workerRoute("long_horizon_execution"),
+        verifier_route: verifierRoute(),
         completion_criteria: ["Worker reports a result"],
         questions: [],
         blocker: null,
@@ -1045,7 +1269,7 @@ test("resumes an interrupted Orchestrator planning turn", async (t) => {
     {
       kind: "start",
       threadId: "planning-verifier",
-      output: passedVerification(),
+      output: passedVerification(fixture.evidencePath),
       usage: verifierUsage,
     },
     {
@@ -1106,7 +1330,7 @@ test("resumes an interrupted Worker turn without rerunning the Orchestrator plan
     {
       kind: "start",
       threadId: "worker-recovery-verifier",
-      output: passedVerification(),
+      output: passedVerification(fixture.evidencePath),
       usage: verifierUsage,
     },
     {
@@ -1140,6 +1364,155 @@ test("resumes an interrupted Worker turn without rerunning the Orchestrator plan
   assert.match(runner.calls[0]?.prompt ?? "", /Do not blindly repeat side effects/);
 });
 
+test("restores the active Journal from the last complete Checkpoint before resuming", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  const first = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner: new FakeAgentRunner([
+      {
+        kind: "start",
+        threadId: "durable-recovery-orchestrator",
+        output: readyPlan(),
+        usage: planUsage,
+      },
+      {
+        kind: "start",
+        threadId: "durable-recovery-worker",
+        startedBeforeError: true,
+        error: new WorkflowInterruptedError(),
+      },
+    ]),
+    leaseMs: 60_000,
+  });
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+
+  await assert.rejects(
+    first.run({
+      workflow_id: workflowId,
+      request: "Resume from durable Worker state",
+      workspace: fixture.workspace,
+    }),
+    WorkflowInterruptedError,
+  );
+  const workflow = first.store.getStoredWorkflow(workflowId);
+  const worker = first.store
+    .listStoredAgentRuns(workflowId)
+    .find((run) => run.role === "worker");
+  assert.ok(workflow?.leaseOwner);
+  assert.ok(workflow.leaseClaimedAt);
+  assert.ok(worker);
+  const journalPath = join(worker.taskDir, "journal.md");
+  writeFileSync(
+    journalPath,
+    "# Journal\n\nDURABLE_DECISION=preserve-the-existing-interface\n",
+    "utf8",
+  );
+  const repository = new CheckpointRepository({
+    workTree: workflow.taskDir,
+    gitDir: join(fixture.stateDir, "checkpoints", `${workflowId}.git`),
+  });
+  const checkpoint = repository.commit("journal.pre_compact", {
+    includeNewResults: false,
+    leaseEpoch: workflow.leaseEpoch,
+  });
+  first.store.recordCheckpoint(
+    {
+      workflowId,
+      owner: workflow.leaseOwner,
+      epoch: workflow.leaseEpoch,
+      claimedAt: workflow.leaseClaimedAt,
+    },
+    worker.id,
+    checkpoint.kind,
+    checkpoint.id,
+    "journal.pre_compact",
+  );
+  writeFileSync(journalPath, "# Journal\n\nCORRUPTED_LIVE_STATE\n", "utf8");
+  first.store.database
+    .prepare("UPDATE workflows SET lease_expires_at = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", workflowId);
+  first.close();
+
+  const runner = new FakeAgentRunner([
+    {
+      kind: "continue",
+      threadId: "durable-recovery-worker",
+      output: completedWorker(),
+      usage: workerUsage,
+    },
+    {
+      kind: "start",
+      threadId: "durable-recovery-verifier",
+      output: passedVerification(fixture.evidencePath),
+      usage: verifierUsage,
+    },
+    {
+      kind: "continue",
+      threadId: "durable-recovery-orchestrator",
+      output: finalCompletion(),
+      usage: orchestratorCumulativeUsage,
+    },
+  ]);
+  const resumed = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+    leaseMs: 60_000,
+  });
+  t.after(() => resumed.close());
+  const output = await resumed.run({
+    workflow_id: workflowId,
+    request: "Resume from durable Worker state",
+    workspace: fixture.workspace,
+  });
+
+  assert.equal(output.status, "completed");
+  assert.match(runner.calls[0]?.journal ?? "", /DURABLE_DECISION/);
+  assert.doesNotMatch(runner.calls[0]?.journal ?? "", /CORRUPTED_LIVE_STATE/);
+  const restored = resumed.store.latestEvent<Record<string, unknown>>(
+    workflowId,
+    "journal.restored",
+  );
+  assert.equal(restored?.payload.commit_id, checkpoint.id);
+});
+
+test("fails explicitly when an interrupted run has no readable complete Checkpoint", async (t) => {
+  const fixture = createFixture();
+  const workflowId = randomUUID();
+  await expectInterruptedRun(fixture, workflowId, [
+    {
+      kind: "start",
+      threadId: "missing-checkpoint-orchestrator",
+      startedBeforeError: true,
+      error: new WorkflowInterruptedError(),
+    },
+  ]);
+  rmSync(join(fixture.stateDir, "checkpoints", `${workflowId}.git`), {
+    recursive: true,
+    force: true,
+  });
+
+  const runner = new FakeAgentRunner([]);
+  const controller = new WorkflowController({
+    stateDir: fixture.stateDir,
+    runner,
+    leaseMs: 60_000,
+  });
+  t.after(() => {
+    controller.close();
+    rmSync(fixture.root, { recursive: true, force: true });
+  });
+  const output = await controller.run({
+    workflow_id: workflowId,
+    request: "Recover one fixture workflow",
+    workspace: fixture.workspace,
+  });
+
+  assert.equal(output.status, "failed");
+  assert.match(output.summary, /no authoritative complete Checkpoint/);
+  assert.equal(runner.calls.length, 0);
+});
+
 test("resumes an interrupted Verifier turn", async (t) => {
   const fixture = createFixture();
   const workflowId = randomUUID();
@@ -1170,7 +1543,7 @@ test("resumes an interrupted Verifier turn", async (t) => {
     {
       kind: "continue",
       threadId: "verifier-recovery-thread",
-      output: passedVerification(),
+      output: passedVerification(fixture.evidencePath),
       usage: verifierUsage,
     },
     {
@@ -1224,7 +1597,7 @@ test("resumes an interrupted final Orchestrator turn", async (t) => {
     {
       kind: "start",
       threadId: "final-recovery-verifier",
-      output: passedVerification(),
+      output: passedVerification(fixture.evidencePath),
       usage: verifierUsage,
     },
     {
@@ -1290,7 +1663,7 @@ test("resumes interrupted fast-path Worker and Verifier turns", async (t) => {
     {
       kind: "start",
       threadId: "fast-recovery-worker-verifier",
-      output: passedVerification(),
+      output: passedVerification(fixture.evidencePath),
       usage: verifierUsage,
     },
   ]);
@@ -1340,7 +1713,7 @@ test("resumes interrupted fast-path Worker and Verifier turns", async (t) => {
     {
       kind: "continue",
       threadId: "fast-recovery-verifier",
-      output: passedVerification(),
+      output: passedVerification(fixture.evidencePath),
       usage: verifierUsage,
     },
   ]);
@@ -1377,7 +1750,7 @@ test("returns an existing terminal outcome without another Agent call", async (t
     {
       kind: "start",
       threadId: "terminal-verifier",
-      output: passedVerification(),
+      output: passedVerification(fixture.evidencePath),
       usage: verifierUsage,
     },
   ]);
@@ -1424,7 +1797,7 @@ test("rejects a reused workflow ID with different immutable input", async (t) =>
       {
         kind: "start",
         threadId: "identity-verifier",
-        output: passedVerification(),
+        output: passedVerification(fixture.evidencePath),
         usage: verifierUsage,
       },
     ]),
@@ -1509,7 +1882,7 @@ test("fences a stale Controller after lease takeover", async (t) => {
     {
       kind: "start",
       threadId: "takeover-verifier",
-      output: passedVerification(),
+      output: passedVerification(fixture.evidencePath),
       usage: verifierUsage,
     },
     {
@@ -1604,7 +1977,7 @@ test("requires user approval after an upstream cyber_policy classification", asy
   assert.equal(output.recovery_requires_user_approval, true);
   assert.equal(output.retry_route, null);
   assert.equal(output.usage_status, "unknown");
-  assert.deepEqual(output.usage, emptyUsage());
+  assert.equal(output.usage, null);
   assert.equal(
     controller.store.latestEvent<Record<string, unknown>>(
       output.workflow_id,
@@ -1665,7 +2038,7 @@ test("keeps usage unknown when a failed workflow has no usage snapshot", async (
     workspace: fixture.workspace,
   });
   assert.equal(output.usage_status, "unknown");
-  assert.deepEqual(output.usage, emptyUsage());
+  assert.equal(output.usage, null);
 });
 
 test("classifies an explicit caller abort as cancelled", async (t) => {
@@ -1697,4 +2070,52 @@ test("classifies an explicit caller abort as cancelled", async (t) => {
   assert.equal(output.recovery_requires_user_approval, false);
   assert.equal(output.usage_status, "unknown");
   assert.equal(controller.store.listStoredAgentRuns(output.workflow_id)[0]?.status, "cancelled");
+});
+
+test("cancels before dispatching a Verifier when the Worker ignores AbortSignal", async (t) => {
+  for (const executionRoute of ["orchestrated", "single_worker"] as const) {
+    const fixture = createFixture();
+    const runner = new AbortIgnoringWorkerRunner(
+      executionRoute === "orchestrated",
+    );
+    const controller = new WorkflowController({
+      stateDir: fixture.stateDir,
+      runner,
+    });
+    const abort = new AbortController();
+    try {
+      const pending = controller.run(
+        {
+          request: `Cancel an abort-ignoring ${executionRoute} Worker`,
+          workspace: fixture.workspace,
+          execution_route: executionRoute,
+          completion_criteria:
+            executionRoute === "single_worker"
+              ? ["The bounded result is observable"]
+              : [],
+        },
+        abort.signal,
+      );
+      await runner.workerStarted;
+      abort.abort();
+      const output = await pending;
+
+      assert.equal(output.status, "cancelled");
+      assert.equal(runner.calls.at(-1), "worker");
+      assert.equal(runner.calls.includes("verifier"), false);
+      assert.equal(
+        controller.store.latestEvent(output.workflow_id, "worker.completed"),
+        undefined,
+      );
+      assert.equal(
+        controller.store
+          .listStoredEvents(output.workflow_id)
+          .filter((event) => event.type === "workflow.terminal").length,
+        1,
+      );
+    } finally {
+      controller.close();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
 });
