@@ -103,6 +103,7 @@ export function buildCodexBaseConfig(
       generate_memories: false,
     },
     features: {
+      apps: false,
       multi_agent: false,
       multi_agent_v2: false,
     },

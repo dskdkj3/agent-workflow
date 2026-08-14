@@ -3,6 +3,20 @@ import test from "node:test";
 
 import { buildCodexBaseConfig } from "./agent-runner.js";
 
+test("backend Agents disable Apps, Memories, and nested subagents", () => {
+  const config = buildCodexBaseConfig();
+
+  assert.deepEqual(config.features, {
+    apps: false,
+    multi_agent: false,
+    multi_agent_v2: false,
+  });
+  assert.deepEqual(config.memories, {
+    use_memories: false,
+    generate_memories: false,
+  });
+});
+
 test("disabled Workflow MCP keeps a valid inert stdio transport", () => {
   const config = buildCodexBaseConfig({
     disabledMcpServerName: "agent-workflow",

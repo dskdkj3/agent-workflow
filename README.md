@@ -22,6 +22,7 @@ Interaction Agent
 - allowlisted model routes: `luna_max`, `terra_high`, `sol_high`, `sol_max`
 - Orchestrator uses `sol_high`; it chooses Worker and Verifier routes from the residual cognitive burden
 - the explicit `single_worker` route uses `luna_max` for both the bounded Worker and mechanical independent Verifier
+- backend Agents explicitly disable Codex Apps, Memories, and nested subagents
 - semantic Journal checkpoints are committed by the Controller to one local, non-project Git repository per workflow
 - an interrupted Controller invocation can resume the original Workflow Run by reusing its caller-generated `workflow_id`
 - monotonic lease epochs fence superseded Controllers, late Agent turns, and stale lifecycle hooks
@@ -192,5 +193,7 @@ Codex config surface for `luna_max` and `sol_max`; it never downgrades `max` to
 `xhigh`.
 
 The repository also contains a Codex plugin manifest and the Interaction skill at
-`skills/use-agent-workflow/`. Daily wrapper and Home Manager wiring remain outside
-this repository.
+`skills/use-agent-workflow/`. Its stable runtime persona is kept separately at
+`skills/use-agent-workflow/references/interaction-persona.md`; unreviewed calibration
+cases are not part of the runtime package. Daily wrapper and Home Manager wiring
+remain outside this repository.
