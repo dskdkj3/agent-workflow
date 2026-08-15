@@ -1,132 +1,273 @@
 # Agent Workflow
 
-Standalone Workflow MCP controller and trace viewer for a minimal Codex-based agent workflow.
+Agent Workflow is a standalone Workflow MCP for running bounded, model-backed
+work with durable task artifacts, independent verification, resumable
+checkpoints, and one authoritative trace. It is intended to make the lifecycle
+around a Codex-based execution explicit: what was requested, which route ran,
+what evidence supports the result, and what remains unknown.
 
-The current MVP exposes one synchronous execution tool with two routes, plus a narrow recorder for explicit recovery decisions:
+This repository is an **MVP / candidate reference implementation**, not a
+production-ready service, a stable public API, or a declaration of full
+Workflow Specification conformance. The accompanying specification is still a
+discussion draft. The implementation is useful for evaluating the synchronous
+vertical slice and its lifecycle guarantees while those interfaces and tests
+continue to evolve.
 
-```text
-Interaction Agent
-  -> workflow.run
-  -> single Worker -> independent Verifier; or
-  -> Orchestrator -> Generic Worker -> independent Verifier -> Orchestrator judgment
-  -> Interaction Agent
+## Quick start
+
+Requirements:
+
+- Node.js 24 or newer
+- npm
+- Git
+
+From a fresh checkout:
+
+```sh
+git clone https://github.com/dskdkj3/agent-workflow.git
+cd agent-workflow
+npm ci
+npm run check
 ```
 
-## Current boundaries
+The check builds the TypeScript sources and runs the deterministic test suite.
+The tests use fake `AgentRunner` implementations for workflow execution; they
+do not spend live model quota. To start the stdio MCP server after the check:
 
-- MCP SDK `2.0.0`, modern protocol revision `2026-07-28`, with stdio compatibility for Codex clients using the `2025-06-18` initialize handshake
-- Codex SDK `0.147.0`
-- stdio transport only
-- MCP tools: `workflow.run` and `workflow.recovery_decision`
-- one Worker and one independent Verifier per completed workflow run
-- allowlisted model routes: `luna_high`, `luna_xhigh`, `luna_max`, `terra_high`, `sol_high`, `sol_max`
-- Orchestrator uses `sol_high`; it classifies residual Worker and Verifier task shape, then the Controller applies a fixed, auditable profile mapping
-- the explicit `single_worker` route uses `luna_high` for both the bounded Worker and mechanical independent Verifier
-- the Interaction policy distinguishes conversation, deliberation, and execution-ready states; read-only research may support deliberation, but only an execution-ready request may mutate a workspace or call `workflow.run`, and advice must be grounded in the user's existing system rather than a generic vendor path
-- backend Agents explicitly disable Codex Apps, Memories, and nested subagents
-- semantic Journal checkpoints are committed by the Controller to one local, non-project Git repository per workflow
-- an interrupted Controller invocation restores active Task and Journal content from the last authoritative complete Checkpoint before resuming the original Workflow Run
-- monotonic lease epochs fence superseded Controllers, late Agent turns, and stale lifecycle hooks
-- caller cancellation is fenced again after every Agent turn, even when a Runner ignores or races its `AbortSignal`
-- Agent-authored long reports are preserved inside a Controller-attested final result instead of being replaced by a short structured summary
-- `passed` Verification requires at least one durable Evidence Reference to an existing regular file inside the Workspace or Workflow task directory
-- one authoritative Workflow Trace powers text, JSON, follow, and loopback-only Web views
-- when the caller exposes the same Codex app-server Unix socket and supplies its
-  thread ID in MCP request metadata, the server best-effort names that thread
-  `Workflow <workflow-id> · <status>` for statusline display
-- no MCP Tasks, MRTR, scheduler, general retry engine, or persistent routing learner
-- standalone Nix package for the internal `agent-workflow-mcp` server; host integration remains external
+```sh
+npm start
+```
 
-## Routing policy
+`npm start` waits for an MCP client on stdin/stdout. The installed read-only
+trace command is available after the build:
 
-The reference implementation treats model family and reasoning effort as separate
-decisions. Model family follows residual ambiguity, breadth, knowledge, and judgment;
-reasoning effort follows task horizon, feedback strength, and iteration depth.
-The Orchestrator emits a task class and rationale rather than a free-form model name:
+```sh
+agent-workflow trace latest
+```
 
-| Task class | Controller profile | Intended residual task |
-| --- | --- | --- |
-| `short_bounded` | `luna_high` | narrow execution with explicit feedback |
-| `bounded_execution` | `luna_xhigh` | ordinary multi-step execution with a strong oracle |
-| `long_horizon_execution` | `luna_max` | difficult or long execution that remains bounded and strongly verifiable |
-| `bounded_judgment` | `terra_high` | clear research or evidence judgment without a mechanical oracle |
-| `irreducible_synthesis` | `sol_high` | inseparable cross-system synthesis after real decomposition |
-| `critical_deliberation` | `sol_max` | system-defining, high-consequence judgment where Sol high is specifically insufficient |
-
-Verifier classes map separately: `mechanical_check` to `luna_high`,
-`bounded_evidence_review` to `terra_high`, `irreducible_review` to `sol_high`,
-and `critical_review` to `sol_max`. A Verifier does not inherit the Worker route merely
-because the topic sounds important.
-
-Every new routed plan records the residual burden, why a lower-cost route is
-insufficient, and the condition that would require escalation. These facts are part
-of the authoritative Workflow Trace. Plans created by older releases remain
-resumable and show `legacy_unknown` instead of receiving an invented rationale.
-
-The bounded-execution effort choices are calibrated against the current
-[DeepSWE v1.1 curve](https://deepswe.datacurve.ai/blog/deepswe-v1-1), not copied from
-its leaderboard. DeepSWE is a long-horizon coding benchmark with executable
-verification; it is not evidence about user-intent interpretation, open-ended
-research, architecture discussion, or safety review. Those roles require local
-workflow evaluations.
-
-## Tool
-
-`workflow.run` accepts a normalized request from the Interaction Agent:
+One synchronous `workflow.run` request can contain the complete coding task.
+Callers SHOULD create and retain the UUID before the first invocation so that
+an identical retry can resume the same Workflow Run or return its existing
+Terminal Outcome:
 
 ```json
 {
   "workflow_id": "de305d54-75b4-431b-adb2-eb6b9e546014",
-  "request": "Implement and verify the requested change",
-  "workspace": "/absolute/path/to/workspace",
-  "execution_route": "single_worker",
-  "completion_criteria": ["The requested behavior is observable and its focused test passes"]
+  "request": "Run the focused tests and report whether the requested behavior is observable.",
+  "workspace": "/absolute/path/to/workspace"
 }
 ```
 
-The Interaction Agent should generate a UUID before the first call and pass it as
-`workflow_id`. If the MCP transport or Controller process disappears, retry the
-identical request, workspace, route, and completion criteria with the same ID.
-The Controller resumes persisted Codex threads and artifacts. If that Workflow is
-already terminal, the retry returns the original Terminal Outcome without another
-model call. Reusing an ID with different immutable input is rejected, and a SQLite
-lease prevents two Controllers from advancing the same Workflow concurrently.
+Omitting `execution_route` selects the default `orchestrated` route, and
+omitting `completion_criteria` supplies an empty list for that route. The
+explicit `single_worker` fast path requires at least one observable criterion:
 
-Omit `execution_route` and `completion_criteria` to use the default Orchestrator
-route. `single_worker` is accepted only with at least one observable completion
-criterion. If the Worker requests escalation or the independent Verifier rejects the
-result, `retry_route` is set to `orchestrated` so the Interaction Agent can retry
-without asking the user to coordinate the correction.
+```json
+{
+  "workflow_id": "de305d54-75b4-431b-adb2-eb6b9e546014",
+  "request": "Add the missing focused test and run it.",
+  "workspace": "/absolute/path/to/workspace",
+  "execution_route": "single_worker",
+  "completion_criteria": ["The focused test passes"]
+}
+```
 
-If an upstream turn is classified as `cyber_policy`, the Workflow stops with
-`recovery_requires_user_approval=true` and `retry_route=null`. The Interaction
-Agent must ask whether the user approves a semantically different recovery. It
-then records the approval or denial on the failed Workflow with
-`workflow.recovery_decision`; this recorder does not retry or mutate the failed
-run. An approved recovery starts as a new Workflow Run with a new ID.
+The MCP result is structured and includes the terminal status, Workflow ID,
+task directory, result path, usage provenance, route, and any questions or
+blocker. A synchronous call may run a full coding task, so clients must use a
+longer tool timeout than a normal short tool; for example,
+`tool_timeout_sec = 3600`.
 
-It returns a structured terminal outcome and paths to the persisted task artifacts.
-The `usage` object sums the latest cumulative SDK usage snapshot for each Agent
-thread. `usage_status` distinguishes `measured`, `estimated`, `partial`, and
-`unknown`; when usage is unknown, `usage` is `null` rather than a numeric zero
-placeholder. A resumed
-Orchestrator's latest snapshot replaces its earlier planning snapshot. Repeated
-tool rounds therefore increase `input_tokens` even when much of the context is
-cached; this measures cumulative model processing, not unique context size.
+## Architecture at a glance
 
-`needs_input` is terminal for the current synchronous invocation. The Interaction
-Agent should discuss the questions with the user, then start a new `workflow.run`
-with the clarified request.
+```text
+Interaction Agent
+  -> workflow.run
+       -> default: Orchestrator -> routed Worker
+       -> fast:    bounded Worker
+       -> fresh-context independent Verifier
+       -> Orchestrator judgment, or Controller finalization on fast path
+  -> Terminal Outcome and artifact paths
 
-Because one call can contain a complete coding task, MCP clients must configure a
-tool timeout longer than their normal short-tool default (for example,
-`tool_timeout_sec = 3600`).
+cyber_policy failure
+  -> workflow.recovery_decision records explicit approval or denial
+  -> an approved semantically different attempt starts as a new Workflow Run
+```
 
-## Workflow Trace
+The Interaction policy keeps user discussion outside backend Agents. A
+`needs_input` result travels back to the Interaction Agent, which discusses the
+questions with the user and starts a new call with clarified input. Backend
+Agents do not coordinate the user, other Agents, Codex Apps, plugins, Memories,
+or nested subagents.
 
-All trace views consume the same read-only projection:
+## Public MCP surface
 
-```bash
+The current implementation uses MCP SDK `2.0.0`, targets protocol revision
+`2026-07-28`, and also serves the `2025-06-18` initialize handshake used by
+current Codex clients. Transport is stdio only; the public tools are
+`workflow.run` and `workflow.recovery_decision`.
+
+### `workflow.run`
+
+`workflow.run` is the synchronous execution tool. Its input is:
+
+| Field | Meaning |
+| --- | --- |
+| `workflow_id` | Optional UUID; callers SHOULD supply and retain it for idempotent retries. |
+| `request` | Required normalized task request text. |
+| `workspace` | Optional absolute workspace path; the Controller resolves the configured default when omitted. |
+| `execution_route` | `orchestrated` (default) or the explicitly bounded `single_worker` fast path. |
+| `completion_criteria` | Observable criteria; required for `single_worker`, optional for the default route. |
+
+An identical retry with the same Workflow ID and immutable input resumes a
+running Workflow or returns its existing Terminal Outcome without another model
+call after termination. Reusing a Workflow ID with changed immutable input is
+invalid. A SQLite lease prevents two Controllers from advancing the same run.
+
+The terminal status is one of `completed`, `needs_input`, `blocked`, `failed`,
+or `cancelled`. `completed` is gated by independent Verification and durable
+Evidence References; internal errors, timeouts, missing checkpoints, unfinished
+verification, and insufficient evidence cannot be represented as completed.
+
+### `workflow.recovery_decision`
+
+This is an idempotent recorder for an explicit user decision after a
+`cyber_policy` failure:
+
+```json
+{
+  "workflow_id": "de305d54-75b4-431b-adb2-eb6b9e546014",
+  "decision_id": "3f2d4e6a-7f3a-4d2b-9c01-1e9e5c2f0b11",
+  "decision": "approved",
+  "note": "Proceed with the semantically different recovery described to me."
+}
+```
+
+It records approval or denial on the failed Workflow and **never retries or
+changes that failed Workflow**. Approval is authority to attempt a materially
+different recovery; it is not itself a retry or a successful result. The new
+attempt receives a new Workflow ID. There is no automatic retry route for a
+`cyber_policy` failure.
+
+## Execution routes and model mapping
+
+The implementation keeps model family and reasoning effort as separate,
+auditable choices. The Orchestrator classifies the residual Worker and
+Verifier task shape; the Controller maps that class to an allowlisted profile.
+Each new routed plan records the residual burden, why a lower-cost route is
+insufficient, and the condition that would require escalation. A topic label
+such as security, architecture, audit, research, privacy, or cross-source is
+not by itself a justification for a Sol route.
+
+The default route uses one `sol_high` Orchestrator, one routed Generic Worker,
+a fresh-context independent Verifier, and the same Orchestrator to finalize:
+
+```text
+Orchestrator (sol_high)
+  -> Generic Worker (Controller-selected profile)
+  -> independent Verifier (Controller-selected profile, fresh thread)
+  -> Orchestrator final judgment
+```
+
+The explicit bounded fast path uses one `luna_high` Worker and one fresh
+`luna_high` Verifier, followed by Controller finalization. If the Worker asks
+for escalation or the Verifier rejects the result, the outcome can expose
+`retry_route: "orchestrated"` for the Interaction Agent to start a new attempt.
+
+### Worker profiles
+
+| Residual Worker task class | Profile | Model and effort |
+| --- | --- | --- |
+| `short_bounded` | `luna_high` | `gpt-5.6-luna`, `high` |
+| `bounded_execution` | `luna_xhigh` | `gpt-5.6-luna`, `xhigh` |
+| `long_horizon_execution` | `luna_max` | `gpt-5.6-luna`, `max` |
+| `bounded_judgment` | `terra_high` | `gpt-5.6-terra`, `high` |
+| `irreducible_synthesis` | `sol_high` | `gpt-5.6-sol`, `high` |
+| `critical_deliberation` | `sol_max` | `gpt-5.6-sol`, `max` |
+
+### Verifier profiles
+
+| Residual Verifier task class | Profile |
+| --- | --- |
+| `mechanical_check` | `luna_high` |
+| `bounded_evidence_review` | `terra_high` |
+| `irreducible_review` | `sol_high` |
+| `critical_review` | `sol_max` |
+
+The allowlist is `luna_high`, `luna_xhigh`, `luna_max`, `terra_high`,
+`sol_high`, and `sol_max`. The real `xhigh` and `max` efforts are preserved
+through the generic Codex configuration surface; `max` is never silently
+downgraded to `xhigh`. The bounded-execution choices were calibrated against
+the current [DeepSWE v1.1 curve](https://deepswe.datacurve.ai/blog/deepswe-v1-1),
+not copied from its leaderboard. That benchmark is not evidence about
+user-intent interpretation, open-ended research, architecture discussion, or
+safety review; those roles require local workflow evaluations.
+
+## Lifecycle, artifacts, and recovery
+
+Before a Workspace mutation or side-effectful execution, the Controller saves a
+Task Request containing the objective, material constraints, completion meaning,
+and allowed working scope. Every Agent owns a `task.md`, `journal.md`, and
+`result.md` under the Workflow task directory:
+
+- `task.md` is the frozen task narrative for that Agent.
+- `journal.md` records decisions, work performed, uncertainty, evidence, and
+  next steps.
+- A completed `result.md` is frozen. An unfinished result left by an interrupted
+  attempt is discarded before resumption.
+- After a turn, any Agent-authored report is preserved inside a
+  Controller-attested result envelope instead of being replaced by only a
+  short structured summary.
+
+SQLite stores lifecycle state, route, events, and authoritative checkpoint
+commit IDs. Markdown artifacts store task narrative and handoff content. A
+separate local Git repository under `checkpoints/<workflow-id>.git` preserves
+semantic versions without touching the Workspace repository. The Controller
+commits `task.md`, `journal.md`, and `result.md` at semantic workflow boundaries.
+
+Every Agent uses a persistent isolated `CODEX_HOME`. The Controller records a
+Codex `thread.started` event immediately, resumes that thread after a process
+interruption, checkpoints Task and Journal on `PreCompact`, and reloads the
+complete Task and Journal on compact `SessionStart`. On process recovery, the
+new Controller restores active artifacts from the newest authoritative complete
+Checkpoint recorded by SQLite. Missing or unreadable recovery artifacts are a
+failure; the Controller does not recreate an empty Journal and pretend that
+recovery succeeded.
+
+Each Controller generation has a monotonic lease epoch. Only the current lease
+owner and epoch may write authoritative events, checkpoints, artifacts, or a
+Terminal Outcome. A stale Controller, Agent turn, or lifecycle hook may leave a
+non-authoritative local Git commit in a narrow race, but it cannot advance the
+Workflow. Caller cancellation is rechecked after every Runner return and before
+persisting completion or dispatching the next Agent, including when a Runner
+ignores or races its `AbortSignal`.
+
+## Verification and safety stops
+
+The Verifier starts in a fresh thread, receives the original request plus
+artifact paths, and does not read the Worker Journal unless it is resolving a
+specific contradiction. A Verifier may return `passed` only when it includes at
+least one Evidence Reference to an existing regular file inside the Workspace
+or Workflow task directory. Missing, unreadable, non-regular, or out-of-scope
+evidence prevents `completed` on every route. The Trace promotes only these
+structured evidence references; free-form evidence mentioned only in a Journal
+remains an Artifact for on-demand inspection and is not treated as an
+authoritative Trace claim.
+
+A `cyber_policy` classification is a hard stop. The implementation preserves
+the failure and artifacts, sets `recovery_requires_user_approval`, exposes no
+automatic retry route, and waits for an explicit Recovery Decision. It does not
+silently rewrite, split, switch, or retry the request. Other route or
+verification failures may return a non-completed outcome or expose the
+bounded `orchestrated` retry suggestion described above.
+
+## Workflow Trace and resource semantics
+
+`Workflow Trace` is the only authoritative read projection. CLI text, JSON,
+follow mode, and the loopback-only Web viewer all consume it rather than
+independently parsing SQLite or Markdown:
+
+```sh
 agent-workflow trace latest
 agent-workflow trace <workflow-id>
 agent-workflow trace --follow <workflow-id>
@@ -134,122 +275,92 @@ agent-workflow trace --json <workflow-id>
 agent-workflow trace --web <workflow-id>
 ```
 
-The Trace includes route, route-class rationale and upgrade trigger, status, timing,
-Agent parent/child relationships, role, model, reasoning effort, requested and
-effective service tier, Codex thread ID, usage provenance, checkpoints, failures,
-recovery decisions, artifact paths, and the durable Evidence References that gate
-`completed`.
-The Web viewer listens only on `127.0.0.1`, is read-only, and polls the same Trace
-projection used by the CLI.
+The Trace includes route and route-class rationale, the upgrade trigger, status,
+timing, Agent parent/child relationships, role, model, reasoning effort,
+requested and effective service tier, Codex thread ID, usage provenance,
+checkpoints, failures, recovery decisions, artifact paths, and durable Evidence
+References.
 
 The current Codex SDK does not reliably expose the service tier actually applied
 by the upstream gateway, and this implementation has no authoritative
-quota-equivalent accounting feed. Trace therefore shows effective Fast state and
-equivalent credits as `unknown` unless an `AgentRunner` adapter supplies measured
-data. Requested service tier is shown separately and is never treated as proof of
-the effective tier.
+quota-equivalent accounting feed. Effective Fast state and equivalent credits
+therefore remain `unknown` unless an `AgentRunner` adapter supplies measured
+data. Requested service tier is shown separately and is never treated as proof
+of the effective tier. Usage is reported as `measured`, `estimated`, `partial`,
+or `unknown`; when it is unknown, the public `usage` value is `null`, not a
+numeric zero placeholder. A resumed thread's latest cumulative SDK snapshot
+replaces its earlier snapshot, so repeated rounds can increase `input_tokens`
+even when context is cached; this is cumulative model processing, not unique
+context size.
 
-## Development
+When a caller exposes the same Codex app-server Unix socket and supplies its
+thread ID in MCP request metadata, the server best-effort names that thread
+`Workflow <workflow-id> · <status>` for statusline display. A missing socket or
+failed title update is a warning and never changes the Workflow outcome.
 
-```bash
-npm install
-npm run check
-npm start
-```
+## Installation and configuration
 
-The flake default package installs the trace command and the internal stdio server:
+The repository provides a standalone Nix package for the internal
+`agent-workflow-mcp` server and the `agent-workflow` trace command:
 
-```bash
+```sh
 nix build
 ./result/bin/agent-workflow trace latest
 ./result/bin/agent-workflow-mcp
 ```
 
-State defaults to `${XDG_STATE_HOME:-~/.local/state}/agent-workflow`. Override it with
-`AGENT_WORKFLOW_STATE_DIR`. Override the SDK-managed Codex executable with
-`AGENT_WORKFLOW_CODEX_PATH` when validating a specific runtime build. If the server
-is registered in child Codex configuration, set `AGENT_WORKFLOW_MCP_SERVER_NAME` to
-that registration name so child Agents cannot recursively invoke this workflow.
-Host integrations may pass provider-specific Codex settings through
-`AGENT_WORKFLOW_CODEX_CONFIG_JSON`; keep secrets out of that JSON and reference an
-inherited environment variable with the provider's `env_key` instead.
-When `CODEX_HOME/app-server-control/app-server-control.sock` exists and Codex adds
-`_meta.threadId` to the tool request, title updates use the app-server's
-`thread/name/set` RPC. A missing socket or failed title update is reported as a
-warning and never changes the Workflow outcome.
+The installed read surface is `agent-workflow trace ...`; the internal MCP
+server remains `agent-workflow-mcp`. State defaults to
+`${XDG_STATE_HOME:-~/.local/state}/agent-workflow` and can be overridden with
+`AGENT_WORKFLOW_STATE_DIR`. Use `AGENT_WORKFLOW_CODEX_PATH` to validate a
+specific SDK-managed Codex executable.
 
-Mutable task artifacts live under `tasks/<workflow-id>/`. Their version history
-lives separately under `checkpoints/<workflow-id>.git`; the Controller commits only
-`task.md`, `journal.md`, and `result.md` at semantic workflow boundaries. Workspace
-repositories are never used for Journal history. A non-Nix installation therefore
-requires `git` in `PATH`; the Nix package supplies it internally.
-Before an Agent turn, an unfinished `result.md` from an interrupted attempt is
-discarded. After the turn, the Controller atomically materializes an attested result
-envelope containing the validated structured outcome, durable Evidence References,
-and any self-contained report the Agent wrote during that turn. Replaying the same
-completion is idempotent; a different structured outcome cannot silently replace a
-frozen result.
-On `single_worker`, the Controller can materialize the Agent's structured terminal
-outcome into its final Journal and result, avoiding model tool rounds whose only
-purpose would be to duplicate the same content before the completion checkpoint.
+If the server is registered in child Codex configuration, set
+`AGENT_WORKFLOW_MCP_SERVER_NAME` to that registration name so backend Agents
+cannot recursively invoke this Workflow MCP. Host integrations may pass
+generic provider-specific Codex settings through
+`AGENT_WORKFLOW_CODEX_CONFIG_JSON`; keep secrets out of that JSON and refer to
+an inherited environment variable with the provider's `env_key` instead.
 
-Each Agent also has a persistent isolated Codex home under
-`codex-homes/<workflow-id>/<agent-run-id>/`. The Controller records the Codex thread
-ID as soon as `thread.started` arrives and resumes that thread after an interruption.
-Before Codex compacts a thread, a trusted `PreCompact` hook commits the latest Task
-and Journal without treating a newly written unfinished result as final. The compact
-`SessionStart` hook reloads the complete Task and Journal. Codex itself preserves the
-startup user-level and project-level `AGENTS.md` instruction chain across compaction,
-so the hook does not duplicate those instructions.
-When a Controller process is restarted, it restores every active Agent's Task and
-Journal from the newest complete Checkpoint recorded in SQLite before constructing
-the recovery prompt. A missing or unreadable complete Checkpoint is a terminal
-failure with an explicit recovery scope; the Controller does not recreate an empty
-Journal and pretend that recovery succeeded.
+Provider wiring stays outside the core. The backend does not use Codex Apps or
+plugins, generate or consume Codex Memories, or create subagents. Daily wrapper
+and Home Manager wiring, desktop integration, PATH installation, systemd, and
+worktree delivery remain outside this repository.
 
-Each Controller execution generation has a monotonic lease epoch. Checkpoint
-commits and lifecycle hook metadata carry that epoch, and child Codex processes
-carry the matching immutable lease identity. A stale generation cannot register
-authoritative events, checkpoints, or a Terminal Outcome after a takeover.
-If a heartbeat runs after its nominal expiry but no takeover has changed the
-owner or epoch, the same generation may renew its lease; once another Controller
-increments the epoch, the old generation remains fenced permanently.
-The separate Git repository may retain an orphan commit created in the narrow window
-before a stale generation loses the SQLite write race. Such a commit is explicitly
-non-authoritative: recovery and Trace consume only Checkpoints recorded under the
-current Workflow state, and epoch-qualified lookup cannot promote it.
+## Scope and known limits
 
-`npm run check` uses fake `AgentRunner` implementations for workflow execution and real stdio
-subprocesses for the MCP `2025-06-18` and `2026-07-28` handshakes. It does not
-spend model quota. `spec/reference-implementation-coverage.json` maps all 33
-normative draft clauses to deterministic tests, an implementation-defined choice,
-or an explicit partial/external/not-implemented limit. This prevents a green unit
-suite from being presented as full Specification conformance; the repository still
-describes this program as a candidate reference implementation.
+- Transport is stdio only. MCP Tasks, MRTR, a scheduler, a general retry
+  engine, and a persistent routing learner are not implemented.
+- The default route still carries most constraints and completion meaning in
+  free-text `request`; a complete stable Task Request field model is not yet
+  exposed. The explicit fast path has a separate `completion_criteria` field.
+- Verification is synchronous in the current vertical slice. The specification
+  permits asynchronous Verification, but this implementation does not expose
+  that capability.
+- `spec/reference-implementation-coverage.json` maps all 33 normative draft
+  clauses to deterministic tests, implementation-defined choices, or explicit
+  partial/external/not-implemented limits. It is an implementation coverage
+  map, not a conformance suite or a full-conformance claim.
+- The TypeScript Codex SDK `0.147.0` does not yet include the real `max` effort
+  in its `ThreadOptions` union. The implementation preserves it through the
+  generic Codex config surface as described above.
+- A current SDK limitation exposes the Codex thread ID but not the App Server
+  turn ID. The Controller therefore persists its own run IDs, ordered events,
+  thread IDs, and checkpoint commit IDs and asks a resumed Agent to reconcile
+  the Workspace; interrupted edits or commands may already have taken effect
+  and must not be replayed blindly.
+- `skills/use-agent-workflow/` is a concise, repo-local, non-installed
+  Interaction policy. Its stable runtime persona is kept at
+  `skills/use-agent-workflow/references/interaction-persona.md`; unreviewed
+  calibration cases are not shipped or injected into runtime context.
 
-## Current implementation limits
+The supported specification language and current gaps are documented in
+[`CONTEXT.md`](./CONTEXT.md), [`spec/DRAFT.zh-CN.md`](./spec/DRAFT.zh-CN.md),
+and [`spec/CONFORMANCE-SCENARIOS.zh-CN.md`](./spec/CONFORMANCE-SCENARIOS.zh-CN.md).
 
-The TypeScript Codex SDK exposes the Codex thread ID but not the App Server turn ID.
-The Controller therefore persists thread IDs, its own run IDs, an ordered event
-sequence, and the Git commit ID for every semantic Journal checkpoint. It resumes the
-thread and asks the Agent to reconcile the current workspace, so interrupted commands
-or edits may already have taken effect and must not be replayed blindly. Detailed
-Worker and Verifier evidence stays in workspace and task artifacts; the final
-Orchestrator prompt receives compact structured outcomes and artifact paths instead
-of Agent conversation history.
+## License
 
-The Workflow Trace promotes only evidence references present in structured
-Verification outcomes. Free-form evidence mentioned only inside a Journal remains
-available as an Artifact for on-demand inspection; it is not turned into an
-authoritative Trace claim by heuristic text parsing.
-
-The SDK `0.147.0` TypeScript `ThreadOptions` union does not yet include the real
-`max` effort. This project passes reasoning effort through the generic Codex config
-surface: `luna_xhigh` remains `xhigh`, while `luna_max` and `sol_max` remain `max`.
-It never downgrades `max` to `xhigh`.
-
-The repository also contains a Codex plugin manifest and the Interaction skill at
-`skills/use-agent-workflow/`. Its stable runtime persona is kept separately at
-`skills/use-agent-workflow/references/interaction-persona.md`; unreviewed calibration
-cases are not part of the runtime package. Daily wrapper and Home Manager wiring
-remain outside this repository.
+Agent Workflow is available under the [Apache License 2.0](./LICENSE).
+`package.json` uses the SPDX identifier `Apache-2.0` and remains marked
+`private: true`; that metadata does not claim that this repository is published
+or intended for npm distribution.
