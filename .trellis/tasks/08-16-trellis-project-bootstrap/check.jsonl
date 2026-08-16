@@ -1,0 +1,8 @@
+{"file":".trellis/spec/workflow/index.md","reason":"Verify the final spec tree, checklist, and quality commands match the repository."}
+{"file":".trellis/spec/workflow/interaction-policy.md","reason":"Review the Interaction/policy boundary against the shipped skill and regression tests."}
+{"file":".trellis/spec/workflow/controller-state.md","reason":"Review lease fencing, checkpoint/recovery, and artifact claims against source and tests."}
+{"file":".trellis/spec/workflow/agent-runner-codex.md","reason":"Review AgentRunner isolation, Codex configuration, and backend feature-policy claims against source and tests."}
+{"file":".trellis/spec/workflow/mcp-trace.md","reason":"Review MCP handshake/tool and single-Trace projection claims against source and tests."}
+{"file":".trellis/spec/workflow/testing-evidence.md","reason":"Review evidence-gate and coverage-map guidance against deterministic tests."}
+{"file":".trellis/spec/workflow/release-compatibility.md","reason":"Review Node/npm/Nix and public compatibility claims against package and flake files."}
+{"file":".trellis/spec/guides/evidence-and-recovery-guide.md","reason":"Review cross-layer evidence and recovery invariants before delivery."}

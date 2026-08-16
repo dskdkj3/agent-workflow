@@ -1,0 +1,6 @@
+{"file":".trellis/spec/workflow/index.md","reason":"Navigation and pre-development checklist for the repository-native workflow spec layer."}
+{"file":".trellis/spec/workflow/controller-state.md","reason":"Lease, state-machine, journal, checkpoint, and recovery contracts for Controller changes."}
+{"file":".trellis/spec/workflow/agent-runner-codex.md","reason":"AgentRunner seam, Codex isolation, backend feature policy, and model-effort constraints."}
+{"file":".trellis/spec/workflow/mcp-trace.md","reason":"MCP public surface, protocol compatibility, and authoritative Trace projection."}
+{"file":".trellis/spec/workflow/testing-evidence.md","reason":"Deterministic test patterns, Evidence Reference gate, and coverage-map maintenance."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Required data-flow review when the project layer crosses policy, Controller, adapter, protocol, or Trace."}

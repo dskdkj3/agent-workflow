@@ -1,0 +1,30 @@
+{
+  "id": "trellis-project-bootstrap",
+  "name": "trellis-project-bootstrap",
+  "title": "Bootstrap Trellis project layer",
+  "description": "依赖外层 nixos-config task .trellis/tasks/08-16-trellis-long-term-adoption；本仓项目层交付目标为 origin/main。只负责 agent-workflow 的 Trellis onboarding、repository-native specs、Codex agent 配置与 project hook wrapper guard，不替代外层集成。",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "xsy",
+  "assignee": "xsy",
+  "createdAt": "2026-08-16",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "origin/main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "dependency": ".trellis/tasks/08-16-trellis-long-term-adoption",
+    "delivery": "origin/main",
+    "repository": "agent-workflow"
+  }
+}
